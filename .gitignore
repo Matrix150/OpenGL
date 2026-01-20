@@ -39,6 +39,10 @@ ARM64/
 *.pch
 *.a
 *.lib
+# Allow committing prebuilt GLFW libs in thirdparty
+!thirdparty/GLFW/lib/
+!thirdparty/GLFW/lib/**/*.lib
+!thirdparty/GLFW/lib/**/*.dll
 *.exp
 *.so
 *.dll
