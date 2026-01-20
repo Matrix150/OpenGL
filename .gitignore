@@ -1,44 +1,97 @@
+# =========================
 # OS
+# =========================
 .DS_Store
 Thumbs.db
 
-# Build output (手动加常见目录)
+# =========================
+# Build output / artifacts
+# =========================
 build/
 bin/
 out/
 dist/
 
-# Object / libs
+# VS build folders (common)
+Debug/
+Release/
+x64/
+x86/
+Win32/
+ARM/
+ARM64/
+
+# Intermediate folders
+*/Debug/
+*/Release/
+*/x64/
+*/x86/
+*/Win32/
+*/ARM/
+*/ARM64/
+
+# =========================
+# Object / libs / binaries
+# =========================
 *.o
 *.obj
+*.ipch
+*.pch
 *.a
 *.lib
+*.exp
 *.so
 *.dll
 *.dylib
 *.pdb
 *.ilk
+*.exe
+*.app
 
-# VS
+# =========================
+# Visual Studio cache / user-specific
+# =========================
 .vs/
-Debug/
-Release/
-x64/
-*.sln
-*.vcxproj*
-*.filters
 *.user
+*.suo
 *.VC.db
 *.VC.opendb
+*.opensdf
+*.sdf
+*.cache
+*.tlog
+*.log
+*.idb
+*.iobj
+*.ipdb
 
-# Xcode
-*.xcodeproj/
-*.xcworkspace/
+# Per-user project settings (DO NOT COMMIT)
+*.vcxproj.user
+
+# VS temporary / upgrade / perf
+UpgradeLog*.htm
+UpgradeLog*.txt
+*_i.c
+*_p.c
+*.ncb
+*.aps
+*.dbmdl
+*.bak
+*.tmp
+
+# ReSharper / VS extensions
+_ReSharper*/
+*.DotSettings.user
+
+# =========================
+# Xcode (just in case)
+# =========================
 DerivedData/
+*.xcworkspace/
+*.xcodeproj/
 
+# =========================
 # JetBrains
+# =========================
 .idea/
 *.iml
-
-# Logs
-*.log
