@@ -1,32 +1,44 @@
-# Prerequisites
-*.d
+# OS
+.DS_Store
+Thumbs.db
 
-# Compiled Object files
-*.slo
-*.lo
+# Build output (手动加常见目录)
+build/
+bin/
+out/
+dist/
+
+# Object / libs
 *.o
 *.obj
-
-# Precompiled Headers
-*.gch
-*.pch
-
-# Compiled Dynamic libraries
-*.so
-*.dylib
-*.dll
-
-# Fortran module files
-*.mod
-*.smod
-
-# Compiled Static libraries
-*.lai
-*.la
 *.a
 *.lib
+*.so
+*.dll
+*.dylib
+*.pdb
+*.ilk
 
-# Executables
-*.exe
-*.out
-*.app
+# VS
+.vs/
+Debug/
+Release/
+x64/
+*.sln
+*.vcxproj*
+*.filters
+*.user
+*.VC.db
+*.VC.opendb
+
+# Xcode
+*.xcodeproj/
+*.xcworkspace/
+DerivedData/
+
+# JetBrains
+.idea/
+*.iml
+
+# Logs
+*.log
