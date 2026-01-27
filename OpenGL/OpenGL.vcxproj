@@ -75,7 +75,7 @@
     <LibraryPath>$(ProjectDir)thirdparty\GLFW\lib;$(LibraryPath)</LibraryPath>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
-    <IncludePath>$(ProjectDir)thirdparty\GLFW\include;$(ProjectDir)thirdparty\glad\include;$(IncludePath)</IncludePath>
+    <IncludePath>$(ProjectDir)thirdparty\GLFW\include;$(ProjectDir)thirdparty\glad\include;$(ProjectDir)header;$(IncludePath)</IncludePath>
     <LibraryPath>$(ProjectDir)thirdparty\GLFW\lib;$(LibraryPath)</LibraryPath>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
@@ -128,6 +128,7 @@
       <SDLCheck>true</SDLCheck>
       <PreprocessorDefinitions>NDEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
+      <LanguageStandard>stdcpp17</LanguageStandard>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
@@ -141,6 +142,13 @@
   <ItemGroup>
     <ClCompile Include="source\main.cpp" />
     <ClCompile Include="thirdparty\glad\src\glad.c" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="header\cyCore.h" />
+    <ClInclude Include="header\cyGL.h" />
+    <ClInclude Include="header\cyMatrix.h" />
+    <ClInclude Include="header\cyTriMesh.h" />
+    <ClInclude Include="header\cyVector.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
