@@ -24,6 +24,15 @@ static float g_objScale = 1.0f;
 // Perspective or Orthographic
 static bool g_usePerspective = true;
 static float g_orthoScale = 1.5f;
+
+// Visualization & shading mode (used by key_callback)
+// 0: full shading, 1: ambient, 2: diffuse, 3: specular, 4: normal-as-color
+static int g_visMode = 0;
+
+// Light properties
+static float g_lightYaw = 0.7f;
+static float g_lightPitch = 0.4f;
+static float g_lightRadius = 3.0f;
 // ------------------------------
 
 
@@ -34,8 +43,8 @@ struct  Shader
     bool reloadShaders = false;
 
     // Read shader from glsl
-    std::string vsPath = "assets/shaders/vertex.glsl";
-    std::string fsPath = "assets/shaders/fragment.glsl";
+    std::string vsPath = "shaders/vertex.glsl";
+    std::string fsPath = "shaders/fragment.glsl";
 
     // Fallback
     const char* vsFallback = R"GLSL(
@@ -50,7 +59,7 @@ struct  Shader
     )GLSL";
 
     const char* fsFallback = R"GLSL(
-        #version 460 core
+               #version 460 core
         out vec4 FragColor;
         void main()
         {
@@ -60,7 +69,7 @@ struct  Shader
 };
 // ------------------------------
 
-// Help tools
+// Helping tools
 static float DegToRad(float deg) 
 {
     return deg * 3.1415926535f / 180.0f; 
@@ -119,6 +128,21 @@ static cy::Matrix4f MakeMVP(int fbW, int fbH)
     return P * V * M;
 }
 
+static cy::Matrix4f MakeMV()
+{
+    cy::Matrix4f R_yaw = cy::Matrix4f::RotationY(g_yaw);
+    cy::Matrix4f R_pitch = cy::Matrix4f::RotationX(g_pitch);
+    cy::Matrix4f Tcam = cy::Matrix4f::Translation(cy::Vec3f(0.0f, 0.0f, -g_dist));
+    cy::Matrix4f V = Tcam * R_pitch * R_yaw;
+
+    cy::Matrix4f Tcenter = cy::Matrix4f::Translation(-g_objCenter);
+    cy::Matrix4f S;
+    S.SetScale(g_objScale);
+    cy::Matrix4f M = S * Tcenter;
+
+    return V * M;
+}
+
 static bool ReadTextFile(const std::string& path, std::string& outText)
 {
     std::ifstream f(path, std::ios::in);
@@ -161,6 +185,24 @@ static bool BuildShaders(Shader& shader)
     std::cout << "[F6] Shader build OK.\n";
     return true;
 }
+
+static cy::Vec3f ComputeLightPosViewSpace(float camYaw, float camPitch, float camDist, float lightYaw, float lightPitch, float lightRadius)
+{
+    // View Matrix (V)
+    cy::Matrix4f R_yaw = cy::Matrix4f::RotationY(camYaw);
+    cy::Matrix4f R_pitch = cy::Matrix4f::RotationX(camPitch);
+    cy::Matrix4f Tcam = cy::Matrix4f::Translation(cy::Vec3f(0.0f, 0.0f, -camDist));
+    cy::Matrix4f V = Tcam * R_pitch * R_yaw;
+
+    // Light Position in world space
+    float cpitch = cosf(lightPitch), spitch = sinf(lightPitch);
+    float cyaw = cosf(lightYaw), syaw = sinf(lightYaw);
+
+    cy::Vec3f lightPosW(lightRadius * cpitch * syaw, lightRadius * spitch, lightRadius * cpitch * cyaw);
+
+    cy::Vec4f lpv4 = V * cy::Vec4f(lightPosW.x, lightPosW.y, lightPosW.z, 1.0f);
+    return cy::Vec3f(lpv4.x, lpv4.y, lpv4.z);
+}
 // ------------------------------
 
 // Event call back
@@ -180,7 +222,7 @@ static void mouse_button_callback(GLFWwindow* window, int button, int action, in
         glfwGetCursorPos(window, &g_lastX, &g_lastY);
 }
 
-static void cursor_pos_callback(GLFWwindow* /*window*/, double x, double y)
+static void cursor_pos_callback(GLFWwindow* window, double x, double y)
 {
     double dx = x - g_lastX;
     double dy = y - g_lastY;
@@ -190,15 +232,30 @@ static void cursor_pos_callback(GLFWwindow* /*window*/, double x, double y)
     const float rotSpeed = 0.005f;
     const float zoomSpeed = 0.02f;
 
+    bool ctrlDown = (glfwGetKey(window, GLFW_KEY_LEFT_CONTROL) == GLFW_PRESS) || (glfwGetKey(window, GLFW_KEY_RIGHT_CONTROL) == GLFW_PRESS);
+
     if (g_leftDown)
     {
-        g_yaw += (float)dx * rotSpeed;
-        g_pitch += (float)dy * rotSpeed;
-        const float limit = 1.55f;      // approximate 89 degrees
-        if (g_pitch > limit)
-            g_pitch = limit;
-        if (g_pitch < -limit)
-            g_pitch = -limit;
+        if (ctrlDown)       // Light rotation
+        {
+            g_lightYaw += (float)dx * rotSpeed;
+            g_lightPitch += (float)dy * rotSpeed;
+            const float limit = 1.55f;
+            if (g_lightPitch > limit) 
+                g_lightPitch = limit;
+            if (g_lightPitch < -limit) 
+                g_lightPitch = -limit;
+        }
+        else        // Camera Rotation
+        {
+            g_yaw += (float)dx * rotSpeed;
+            g_pitch += (float)dy * rotSpeed;
+            const float limit = 1.55f;      // approximate 89 degrees
+            if (g_pitch > limit)
+                g_pitch = limit;
+            if (g_pitch < -limit)
+                g_pitch = -limit;
+        }
     }
     if (g_rightDown)
     {
@@ -229,6 +286,35 @@ static void key_callback(GLFWwindow* window, int key, int /*scancode*/, int acti
     {
         g_usePerspective = !g_usePerspective;
         std::cout << "[P] Projection = " << (g_usePerspective ? "Perspective" : "Orthographic") << std::endl;
+    }
+    // 1-3 to for Blinn components, 0 for full shading, N for normal visualization
+    if (action == GLFW_PRESS)
+    {
+        if (key == GLFW_KEY_0)
+        {
+            g_visMode = 0;
+            std::cout << "[0] Shading = full (ambient+diffuse+spec)" << std::endl;
+        }
+        if (key == GLFW_KEY_1) 
+        {
+            g_visMode = 1; 
+            std::cout << "[1] Shading = ambient" << std::endl; 
+        }
+        if (key == GLFW_KEY_2) 
+        {
+            g_visMode = 2;
+            std::cout << "[2] Shading = diffuse" << std::endl; 
+        }
+        if (key == GLFW_KEY_3) 
+        { 
+            g_visMode = 3; 
+            std::cout << "[3] Shading = specular" << std::endl; 
+        }
+        if (key == GLFW_KEY_N) 
+        {
+            g_visMode = 4; 
+            std::cout << "[N] Shading = normal-as-color" << std::endl; 
+        }
     }
 }
 // ------------------------------
@@ -280,7 +366,55 @@ int main(int argc, char** argv)
     float diag = sqrt(ext.x * ext.x + ext.y * ext.y + ext.z * ext.z) * g_objScale;
     g_dist = max(2.0f, diag * 0.1f);
     g_orthoScale = 1.5f;
+
+    // Build triangle index buffer (EBO)
+    std::vector<unsigned int> indices;
+    indices.reserve(mesh.NF() * 3);
+    for (unsigned int fi = 0; fi < mesh.NF(); ++fi)
+    {
+        auto f = mesh.F((int)fi);
+        indices.push_back((unsigned int)f.v[0]);
+        indices.push_back((unsigned int)f.v[1]);
+        indices.push_back((unsigned int)f.v[2]);
+    }
+
+    // Generate per-vertex normals by accumulating face normals
+    std::vector<cy::Vec3f> nAcc(mesh.NV(), cy::Vec3f(0.0f, 0.0f, 0.0f));
+    for (unsigned int fi = 0; fi < mesh.NF(); ++fi)
+    {
+        auto f = mesh.F((int)fi);
+        int i0 = f.v[0], i1 = f.v[1], i2 = f.v[2];
+        cy::Vec3f p0 = mesh.V(i0);
+        cy::Vec3f p1 = mesh.V(i1);
+        cy::Vec3f p2 = mesh.V(i2);
+
+        cy::Vec3f e1 = p1 - p0;
+        cy::Vec3f e2 = p2 - p0;
+        cy::Vec3f fn = e1.Cross(e2); // unnormalized face normal (area-weighted)
+
+        nAcc[i0] += fn;
+        nAcc[i1] += fn;
+        nAcc[i2] += fn;
+    }
+
+    std::vector<float> normals;
+    normals.reserve(mesh.NV() * 3);
+    for (unsigned int i = 0; i < mesh.NV(); ++i)
+    {
+        cy::Vec3f n = nAcc[i];
+        float len2 = n.x * n.x + n.y * n.y + n.z * n.z;
+        if (len2 > 1e-20f)
+            n *= (1.0f / std::sqrt(len2));
+        else
+            n = cy::Vec3f(0.0f, 1.0f, 0.0f);
+
+        normals.push_back(n.x);
+        normals.push_back(n.y);
+        normals.push_back(n.z);
+    }
+
     const GLsizei vertexCount = (GLsizei)mesh.NV();
+    const GLsizei indexCount = (GLsizei)indices.size();
     
     // GLFW
     if (!glfwInit())
@@ -297,7 +431,7 @@ int main(int argc, char** argv)
     // Initialize viewport size
     const int initW = 1280;
     const int initH = 720;
-    GLFWwindow* window = glfwCreateWindow(initW, initH, "Project 2 - Transformations", nullptr, nullptr);
+    GLFWwindow* window = glfwCreateWindow(initW, initH, "Project 3 - Shading", nullptr, nullptr);
     if (!window)
     {
         std::cerr << "ERROR: glfwCreateWindow failed\n";
@@ -333,9 +467,11 @@ int main(int argc, char** argv)
         return -1;
     }
 
-    GLuint vao = 0, vbo = 0;
+    GLuint vao = 0, vbo = 0, nbo = 0, ebo = 0;
     glCreateVertexArrays(1, &vao);
     glCreateBuffers(1, &vbo);
+    glCreateBuffers(1, &nbo);
+    glCreateBuffers(1, &ebo);
 
     glNamedBufferData(
         vbo,
@@ -343,6 +479,23 @@ int main(int argc, char** argv)
         positions.data(),
         GL_STATIC_DRAW
     );
+
+    glNamedBufferData(
+        nbo,
+        (GLsizeiptr)(normals.size() * sizeof(float)),
+        normals.data(),
+        GL_STATIC_DRAW
+    );
+
+    glNamedBufferData(
+        ebo,
+        (GLsizeiptr)(indices.size() * sizeof(unsigned int)),
+        indices.data(),
+        GL_STATIC_DRAW
+    );
+
+    // Attach EBO to VAO
+    glVertexArrayElementBuffer(vao, ebo);
 
     glVertexArrayVertexBuffer(
         vao,        // VAO
@@ -352,11 +505,26 @@ int main(int argc, char** argv)
         3 * sizeof(float) // stride
     );
 
+    // Normal buffer at binding=1
+    glVertexArrayVertexBuffer(
+        vao,
+        1,
+        nbo,
+        0,
+        3 * sizeof(float)
+    );
+
+
     glEnableVertexArrayAttrib(vao, 0);
     glVertexArrayAttribFormat(vao, 0, 3, GL_FLOAT, GL_FALSE, 0);
     glVertexArrayAttribBinding(vao, 0, 0);
+
+    glEnableVertexArrayAttrib(vao, 1);
+    glVertexArrayAttribFormat(vao, 1, 3, GL_FLOAT, GL_FALSE, 0);
+    glVertexArrayAttribBinding(vao, 1, 1);
     glEnable(GL_PROGRAM_POINT_SIZE);
 
+    glEnable(GL_DEPTH_TEST);
     while (!glfwWindowShouldClose(window))
     {
         /*// Automatically animate the background color
@@ -382,17 +550,24 @@ int main(int argc, char** argv)
         glfwGetFramebufferSize(window, &fbW, &fbH);
 
         cy::Matrix4f MVP = MakeMVP(fbW, fbH);
+        cy::Matrix4f MV = MakeMV();
 
         glClearColor(0.08f, 0.08f, 0.10f, 1.0f);
-        glClear(GL_COLOR_BUFFER_BIT);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
         shader.prog.Bind();
         shader.prog.SetUniformMatrix4("uMVP", MVP.cell);
+        shader.prog.SetUniformMatrix4("uMV", MV.cell);
+        shader.prog.SetUniform("uVisMode", g_visMode);
+        cy::Vec3f lightPosV = ComputeLightPosViewSpace(g_yaw, g_pitch, g_dist, g_lightYaw, g_lightPitch, g_lightRadius);
+        shader.prog.SetUniform("uLightPosV", lightPosV.x, lightPosV.y, lightPosV.z);
         glBindVertexArray(vao);
-        glDrawArrays(GL_POINTS, 0, vertexCount);
+        glDrawElements(GL_TRIANGLES, indexCount, GL_UNSIGNED_INT, (void*)0);
         glfwSwapBuffers(window);
         glfwPollEvents();
     }
+    glDeleteBuffers(1, &ebo);
+    glDeleteBuffers(1, &nbo);
     glDeleteBuffers(1, &vbo);
     glDeleteVertexArrays(1, &vao);
 
