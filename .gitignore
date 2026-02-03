@@ -34,7 +34,6 @@ ARM64/
 # Object / libs / binaries
 # =========================
 *.o
-*.obj
 *.ipch
 *.pch
 *.a
