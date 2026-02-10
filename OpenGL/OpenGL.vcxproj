@@ -143,6 +143,7 @@
     </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClCompile Include="source\lodepng.cpp" />
     <ClCompile Include="source\main.cpp" />
     <ClCompile Include="thirdparty\glad\src\glad.c" />
   </ItemGroup>
@@ -152,6 +153,7 @@
     <ClInclude Include="header\cyMatrix.h" />
     <ClInclude Include="header\cyTriMesh.h" />
     <ClInclude Include="header\cyVector.h" />
+    <ClInclude Include="header\lodepng.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

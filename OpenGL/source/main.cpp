@@ -1,9 +1,11 @@
 #include <iostream>
+
 #include <glad/glad.h>
 #include <GLFW/glfw3.h>
 #include "cyGL.h"
 #include "cyTriMesh.h"
 #include "cyMatrix.h"
+#include "lodepng.h"
 
 
 // Properties
@@ -33,6 +35,29 @@ static int g_visMode = 0;
 static float g_lightYaw = 0.7f;
 static float g_lightPitch = 0.4f;
 static float g_lightRadius = 3.0f;
+
+// Texture
+struct TexturePaths
+{
+    std::string kd;     // Diffuse
+	std::string ks;     // Specular
+};
+
+struct GPUMaterial
+{
+    cy::Vec3f Ka{ 0, 0, 0 };
+    cy::Vec3f Kd{ 1, 1, 1 };
+    cy::Vec3f Ks{ 0, 0, 0 };
+    cy::Vec3f Tf{ 0, 0, 0 };
+	float Ns = 0.0f;
+	float Ni = 1.0f;
+	int illum = 2;
+
+    GLuint texKd = 0;
+	GLuint texKs = 0;
+	bool hasKd = false;
+	bool hasKs = false;
+};
 // ------------------------------
 
 
@@ -203,6 +228,50 @@ static cy::Vec3f ComputeLightPosViewSpace(float camYaw, float camPitch, float ca
     cy::Vec4f lpv4 = V * cy::Vec4f(lightPosW.x, lightPosW.y, lightPosW.z, 1.0f);
     return cy::Vec3f(lpv4.x, lpv4.y, lpv4.z);
 }
+
+static bool LoadPNGTexture(const std::string& pngPath, std::vector<unsigned char>& outRGBA, unsigned& outW, unsigned& outH)
+{
+	outRGBA.clear();
+	outW = outH = 0;
+	unsigned err = lodepng::decode(outRGBA, outW, outH, pngPath);
+    if (err != 0)
+    {
+        std::cerr << "ERROR: lodepng decode failed: " << pngPath << " (" << err << ": " << lodepng_error_text(err) << ")\n";
+		return false;
+    }
+    return true;
+}
+
+static GLuint CreateTexture2D(unsigned w, unsigned h, const unsigned char* rgba)
+{
+    if (!rgba || w == 0 || h == 0)
+        return 0;
+
+    GLuint tex = 0;
+	glCreateTextures(GL_TEXTURE_2D, 1, &tex);
+	glTextureStorage2D(tex, 1, GL_RGBA8, (GLsizei)w, (GLsizei)h);
+	glTextureSubImage2D(tex, 0, 0, 0, (GLsizei)w, (GLsizei)h, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+
+    glTextureParameteri(tex, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    glTextureParameteri(tex, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTextureParameteri(tex, GL_TEXTURE_WRAP_S, GL_REPEAT);
+	glTextureParameteri(tex, GL_TEXTURE_WRAP_T, GL_REPEAT);
+
+	glGenerateTextureMipmap(tex);
+	return tex;
+}
+
+static std::string ResolveTexPath(const std::string& objPathStr, const char* rel)
+{
+    if (!rel || rel[0] == '\0') 
+        return {};
+    std::filesystem::path objPath(objPathStr);
+    std::filesystem::path baseDir = objPath.has_parent_path() ? objPath.parent_path() : std::filesystem::path(".");
+    std::filesystem::path p(rel);
+    if (p.is_relative()) 
+        p = baseDir / p;
+    return p.lexically_normal().string();
+}
 // ------------------------------
 
 // Event call back
@@ -266,7 +335,7 @@ static void cursor_pos_callback(GLFWwindow* window, double x, double y)
             g_dist = 5.0f;
     }
 }
-
+ 
 static void key_callback(GLFWwindow* window, int key, int /*scancode*/, int action, int /*mods*/)
 {
     // ESC to close window
@@ -335,17 +404,12 @@ int main(int argc, char** argv)
         return -1;
     }
 
-    // Get vertices & bounding box
-    std::vector<float> positions;
-    positions.reserve(mesh.NV() * 3);
+	// Get vertices & bounding box & center & scale
     cy::Vec3f bbMin(1e30f, 1e30f, 1e30f);
     cy::Vec3f bbMax(-1e30f, -1e30f, -1e30f);
     for (unsigned int i = 0; i < mesh.NV(); ++i)
     {
         cy::Vec3f p = mesh.V((int)i);
-        positions.push_back(p.x);
-        positions.push_back(p.y);
-        positions.push_back(p.z);
         bbMin.x = min(bbMin.x, p.x);
         bbMin.y = min(bbMin.y, p.y);
         bbMin.z = min(bbMin.z, p.z);
@@ -367,54 +431,54 @@ int main(int argc, char** argv)
     g_dist = max(2.0f, diag * 0.1f);
     g_orthoScale = 1.5f;
 
-    // Build triangle index buffer (EBO)
-    std::vector<unsigned int> indices;
-    indices.reserve(mesh.NF() * 3);
+    mesh.ComputeNormals();
+	const bool hasUV = mesh.HasTextureVertices();
+
+	std::vector<float> positions;
+    positions.reserve(mesh.NF() * 3 * 3);
+	std::vector<float> normals;
+	normals.reserve(mesh.NF() * 3 * 3);
+	std::vector<float> uvs;
+	uvs.reserve(mesh.NF() * 3 * 2);
+
     for (unsigned int fi = 0; fi < mesh.NF(); ++fi)
     {
         auto f = mesh.F((int)fi);
-        indices.push_back((unsigned int)f.v[0]);
-        indices.push_back((unsigned int)f.v[1]);
-        indices.push_back((unsigned int)f.v[2]);
+		auto fn = mesh.FN((int)fi);
+		auto ft = hasUV ? mesh.FT((int)fi) : cy::TriMesh::TriFace();
+
+        for (int c = 0; c < 3; ++c)
+        {
+            int vi = f.v[c];
+			int ni = fn.v[c];
+            cy::Vec3f p = mesh.V(vi);
+            cy::Vec3f n = (mesh.NVN() > 0 && ni >= 0) ? mesh.VN(ni) : cy::Vec3f(0, 1, 0);
+
+            positions.push_back(p.x);
+            positions.push_back(p.y);
+            positions.push_back(p.z);
+
+            normals.push_back(n.x);
+            normals.push_back(n.y);
+            normals.push_back(n.z);
+
+            float u = 0.0f, v = 0.0f;
+            if (hasUV)
+            {
+                int ti = ft.v[c];
+                if (ti >= 0 && (unsigned)ti < mesh.NVT())
+                {
+                    cy::Vec3f t = mesh.VT(ti);
+                    u = t.x;
+                    v = t.y;
+                }
+            }
+            uvs.push_back(u);
+            uvs.push_back(v);
+        }
     }
 
-    // Generate per-vertex normals by accumulating face normals
-    std::vector<cy::Vec3f> nAcc(mesh.NV(), cy::Vec3f(0.0f, 0.0f, 0.0f));
-    for (unsigned int fi = 0; fi < mesh.NF(); ++fi)
-    {
-        auto f = mesh.F((int)fi);
-        int i0 = f.v[0], i1 = f.v[1], i2 = f.v[2];
-        cy::Vec3f p0 = mesh.V(i0);
-        cy::Vec3f p1 = mesh.V(i1);
-        cy::Vec3f p2 = mesh.V(i2);
-
-        cy::Vec3f e1 = p1 - p0;
-        cy::Vec3f e2 = p2 - p0;
-        cy::Vec3f fn = e1.Cross(e2); // unnormalized face normal (area-weighted)
-
-        nAcc[i0] += fn;
-        nAcc[i1] += fn;
-        nAcc[i2] += fn;
-    }
-
-    std::vector<float> normals;
-    normals.reserve(mesh.NV() * 3);
-    for (unsigned int i = 0; i < mesh.NV(); ++i)
-    {
-        cy::Vec3f n = nAcc[i];
-        float len2 = n.x * n.x + n.y * n.y + n.z * n.z;
-        if (len2 > 1e-20f)
-            n *= (1.0f / std::sqrt(len2));
-        else
-            n = cy::Vec3f(0.0f, 1.0f, 0.0f);
-
-        normals.push_back(n.x);
-        normals.push_back(n.y);
-        normals.push_back(n.z);
-    }
-
-    const GLsizei vertexCount = (GLsizei)mesh.NV();
-    const GLsizei indexCount = (GLsizei)indices.size();
+    //const GLsizei drawVertexCount = (GLsizei)(mesh.NF() * 3);
     
     // GLFW
     if (!glfwInit())
@@ -431,7 +495,7 @@ int main(int argc, char** argv)
     // Initialize viewport size
     const int initW = 1280;
     const int initH = 720;
-    GLFWwindow* window = glfwCreateWindow(initW, initH, "Project 3 - Shading", nullptr, nullptr);
+    GLFWwindow* window = glfwCreateWindow(initW, initH, "Project 4 - Textures", nullptr, nullptr);
     if (!window)
     {
         std::cerr << "ERROR: glfwCreateWindow failed\n";
@@ -467,11 +531,65 @@ int main(int argc, char** argv)
         return -1;
     }
 
-    GLuint vao = 0, vbo = 0, nbo = 0, ebo = 0;
+    // Build GPU Materials
+    std::vector<GPUMaterial> gpuMtls;
+    if (mesh.NM() > 0)
+    {
+	    gpuMtls.resize(mesh.NM());
+
+        for (unsigned int mi = 0; mi < mesh.NM(); ++mi)
+        {
+		    const auto& mtl = mesh.M((int)mi);
+		    GPUMaterial gpuMtl;
+		    gpuMtl.Ka = cy::Vec3f(mtl.Ka[0], mtl.Ka[1], mtl.Ka[2]);
+		    gpuMtl.Kd = cy::Vec3f(mtl.Kd[0], mtl.Kd[1], mtl.Kd[2]);
+		    gpuMtl.Ks = cy::Vec3f(mtl.Ks[0], mtl.Ks[1], mtl.Ks[2]);
+		    gpuMtl.Tf = cy::Vec3f(mtl.Tf[0], mtl.Tf[1], mtl.Tf[2]);
+		    gpuMtl.Ns = mtl.Ns;
+		    gpuMtl.Ni = mtl.Ni;
+		    gpuMtl.illum = mtl.illum;
+
+            // map_kd
+		    std::string kdPath = ResolveTexPath(argv[1], mtl.map_Kd.data);
+            if (!kdPath.empty())
+            {
+                std::vector<unsigned char> rgba;
+                unsigned w = 0, h = 0;
+                if (LoadPNGTexture(kdPath, rgba, w, h))
+                {
+                    gpuMtl.texKd = CreateTexture2D(w, h, rgba.data());
+				    gpuMtl.hasKd = (gpuMtl.texKd != 0);
+                    std::cout << "Material " << mi << " map_Kd: " << kdPath << "\n";
+                }
+            }
+
+            // map_Ks
+		    std::string ksPath = ResolveTexPath(argv[1], mtl.map_Ks.data);
+            if (!ksPath.empty())
+            {
+                std::vector<unsigned char> rgba;
+                unsigned w = 0, h = 0;
+                if (LoadPNGTexture(ksPath, rgba, w, h))
+                {
+				    gpuMtl.texKs = CreateTexture2D(w, h, rgba.data());
+                    gpuMtl.hasKs = (gpuMtl.texKs != 0);
+                    std::cout << "Material " << mi << " map_Ks: " << ksPath << "\n";
+                }
+            }
+
+		    gpuMtls[mi] = gpuMtl;
+        }
+    }
+    else    // No materials in OBJ/MTL
+    {
+        gpuMtls.resize(1);
+    }
+
+    GLuint vao = 0, vbo = 0, nbo = 0, tbo = 0;
     glCreateVertexArrays(1, &vao);
     glCreateBuffers(1, &vbo);
     glCreateBuffers(1, &nbo);
-    glCreateBuffers(1, &ebo);
+    glCreateBuffers(1, &tbo);
 
     glNamedBufferData(
         vbo,
@@ -488,14 +606,11 @@ int main(int argc, char** argv)
     );
 
     glNamedBufferData(
-        ebo,
-        (GLsizeiptr)(indices.size() * sizeof(unsigned int)),
-        indices.data(),
+        tbo,
+        (GLsizeiptr)(uvs.size() * sizeof(float)),
+        uvs.data(),
         GL_STATIC_DRAW
     );
-
-    // Attach EBO to VAO
-    glVertexArrayElementBuffer(vao, ebo);
 
     glVertexArrayVertexBuffer(
         vao,        // VAO
@@ -504,7 +619,6 @@ int main(int argc, char** argv)
         0,          // offset
         3 * sizeof(float) // stride
     );
-
     // Normal buffer at binding=1
     glVertexArrayVertexBuffer(
         vao,
@@ -513,7 +627,13 @@ int main(int argc, char** argv)
         0,
         3 * sizeof(float)
     );
-
+    glVertexArrayVertexBuffer(
+        vao, 
+        2, 
+        tbo, 
+        0, 
+        2 * sizeof(float)
+    );
 
     glEnableVertexArrayAttrib(vao, 0);
     glVertexArrayAttribFormat(vao, 0, 3, GL_FLOAT, GL_FALSE, 0);
@@ -522,9 +642,13 @@ int main(int argc, char** argv)
     glEnableVertexArrayAttrib(vao, 1);
     glVertexArrayAttribFormat(vao, 1, 3, GL_FLOAT, GL_FALSE, 0);
     glVertexArrayAttribBinding(vao, 1, 1);
-    glEnable(GL_PROGRAM_POINT_SIZE);
+
+    glEnableVertexArrayAttrib(vao, 2);
+    glVertexArrayAttribFormat(vao, 2, 2, GL_FLOAT, GL_FALSE, 0);
+    glVertexArrayAttribBinding(vao, 2, 2);
 
     glEnable(GL_DEPTH_TEST);
+
     while (!glfwWindowShouldClose(window))
     {
         /*// Automatically animate the background color
@@ -561,12 +685,72 @@ int main(int argc, char** argv)
         shader.prog.SetUniform("uVisMode", g_visMode);
         cy::Vec3f lightPosV = ComputeLightPosViewSpace(g_yaw, g_pitch, g_dist, g_lightYaw, g_lightPitch, g_lightRadius);
         shader.prog.SetUniform("uLightPosV", lightPosV.x, lightPosV.y, lightPosV.z);
+
+        // Texture units
+        shader.prog.SetUniform("uDiffuseTex", 0);
+        shader.prog.SetUniform("uSpecularTex", 1);
         glBindVertexArray(vao);
-        glDrawElements(GL_TRIANGLES, indexCount, GL_UNSIGNED_INT, (void*)0);
+
+		// Support multiple materials
+        if (mesh.NM() > 0)
+        {
+            for (unsigned int mi = 0; mi < mesh.NM(); ++mi)
+            {
+                int firstFace = mesh.GetMaterialFirstFace((int)mi);
+                int faceCount = mesh.GetMaterialFaceCount((int)mi);
+                if (faceCount <= 0) 
+                    continue;
+
+                const GPUMaterial& m = gpuMtls[mi];
+
+				// Set material properties
+                shader.prog.SetUniform("uKa", m.Ka.x, m.Ka.y, m.Ka.z);
+                shader.prog.SetUniform("uKd", m.Kd.x, m.Kd.y, m.Kd.z);
+                shader.prog.SetUniform("uKs", m.Ks.x, m.Ks.y, m.Ks.z);
+                shader.prog.SetUniform("uTf", m.Tf.x, m.Tf.y, m.Tf.z);
+                shader.prog.SetUniform("uNs", m.Ns);
+                shader.prog.SetUniform("uNi", m.Ni);
+                shader.prog.SetUniform("uIllum", m.illum);
+
+                // Binding Texture (unit0 = kd, unit1 = ks)
+                glBindTextureUnit(0, m.texKd);
+                glBindTextureUnit(1, m.texKs);
+                shader.prog.SetUniform("uHasDiffuseTex", m.hasKd);
+                shader.prog.SetUniform("uHasSpecularTex", m.hasKs);
+
+                glDrawArrays(GL_TRIANGLES, firstFace * 3, faceCount * 3);
+            }
+        }
+		else    // If no material
+        {
+            const GPUMaterial& m = gpuMtls[0];
+            shader.prog.SetUniform("uKa", m.Ka.x, m.Ka.y, m.Ka.z);
+            shader.prog.SetUniform("uKd", m.Kd.x, m.Kd.y, m.Kd.z);
+            shader.prog.SetUniform("uKs", m.Ks.x, m.Ks.y, m.Ks.z);
+            shader.prog.SetUniform("uTf", m.Tf.x, m.Tf.y, m.Tf.z);
+            shader.prog.SetUniform("uNs", m.Ns);
+            shader.prog.SetUniform("uNi", m.Ni);
+            shader.prog.SetUniform("uIllum", m.illum);
+
+            glBindTextureUnit(0, 0);
+            glBindTextureUnit(1, 0);
+            shader.prog.SetUniform("uHasDiffuseTex", false);
+            shader.prog.SetUniform("uHasSpecularTex", false);
+
+            glDrawArrays(GL_TRIANGLES, 0, (GLsizei)(mesh.NF() * 3));
+        }
+
         glfwSwapBuffers(window);
         glfwPollEvents();
     }
-    glDeleteBuffers(1, &ebo);
+
+	// Clean up materials
+    for (auto& m : gpuMtls)
+    {
+        if (m.texKd) glDeleteTextures(1, &m.texKd);
+        if (m.texKs) glDeleteTextures(1, &m.texKs);
+    }
+    glDeleteBuffers(1, &tbo);
     glDeleteBuffers(1, &nbo);
     glDeleteBuffers(1, &vbo);
     glDeleteVertexArrays(1, &vao);
