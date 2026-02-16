@@ -38,12 +38,13 @@ void main()
 
     // Simple Blinn-Phong defaults from .mtl
     vec3 Ka = uKa;
-    vec3 Kd = uHasDiffuseTex ? kdTex : uKa;
+    vec3 Kd = uHasDiffuseTex ? kdTex : uKd;
     vec3 Ks = uKs * ksTex;
     float shininess = max(uNs, 1.0);
 
-    vec3 ambient  = Ka * Kd;
-    vec3 diffuse  = Kd * NdotL;
+    vec3 albedo = uHasDiffuseTex ? kdTex : uKd;
+    vec3 ambient  = 0.1 * albedo;
+    vec3 diffuse  = albedo * NdotL;
 
     vec3 specular = vec3(0.0);
     if (uIllum >= 2 && NdotL > 0.0)

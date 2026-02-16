@@ -14,10 +14,15 @@ static bool g_leftDown = false;
 static bool g_rightDown = false;
 static double g_lastX = 0.0, g_lastY = 0.0;
 
-// Camera parameter
+// Camera parameter (object -> render to texture)
 static float g_yaw = 0.0f;
 static float g_pitch = 0.0f;
 static float g_dist = 2.0f;
+
+// Camera parameter (plane view -> default framebuffer, hold ALT/Option to control)
+static float g_planeYaw = 0.0f;
+static float g_planePitch = 0.0f;
+static float g_planeDist = 2.0f;
 
 // Object
 static cy::Vec3f g_objCenter(0.0f, 0.0f, 0.0f);
@@ -92,6 +97,38 @@ struct  Shader
         }
     )GLSL";
 };
+
+// Plane shader (render to a quad)
+struct PlaneShader
+{
+    cy::GLSLProgram prog;
+    bool built = false;
+
+    const char* vs = R"GLSL(
+        #version 460 core
+        layout(location=0) in vec3 aPos;
+        layout(location=1) in vec2 aUV;
+        uniform mat4 uMVP;
+        out vec2 vUV;
+        void main()
+        {
+            vUV = aUV;
+            gl_Position = uMVP * vec4(aPos, 1.0);
+        }
+    )GLSL";
+    const char* fs = R"GLSL(
+        #version 460 core
+        in vec2 vUV;
+        uniform sampler2D uTex;
+        uniform vec3 uAdd;
+        out vec4 FragColor;
+        void main()
+        {
+            vec3 c = texture(uTex, vUV).rgb + uAdd;   // small constant to separate from background
+            FragColor = vec4(clamp(c, 0.0, 1.0), 1.0);
+        }
+    )GLSL";
+};
 // ------------------------------
 
 // Helping tools
@@ -115,56 +152,64 @@ static cy::Matrix4f MakeOrthographic(float l, float r, float b, float t, float n
     return M;
 }
 
-static cy::Matrix4f MakeMVP(int fbW, int fbH)
+static cy::Matrix4f MakeProjection(int fbW, int fbH, bool usePerspective, float orthoScale)
 {
     float aspect = (fbH > 0) ? (float)fbW / (float)fbH : 1.0f;
-
-    // Projection
-    cy::Matrix4f P;
-    if (g_usePerspective)
+    if (usePerspective)
     {
-        P = cy::Matrix4f::Perspective(DegToRad(60.0f), aspect, 0.1f, 100.0f);       // Perspective
-    }
-    else
-    {
-        float halfH = g_orthoScale;
-        float halfW = g_orthoScale * aspect;
-        P = MakeOrthographic(-halfW, halfW, -halfH, halfH, 0.1f, 200.0f);
+        return cy::Matrix4f::Perspective(DegToRad(60.0f), aspect, 0.1f, 100.0f);       // Perspective
     }
 
-    cy::Matrix4f R_yaw = cy::Matrix4f::RotationY(g_yaw);
-    cy::Matrix4f R_pitch = cy::Matrix4f::RotationX(g_pitch);
-    cy::Matrix4f Tcam = cy::Matrix4f::Translation(cy::Vec3f(0.0f, 0.0f, -g_dist));
-    // V = T * R_pitch * R_yaw
-    cy::Matrix4f V = Tcam * R_pitch * R_yaw;
+    float halfH = orthoScale;
+    float halfW = orthoScale * aspect;
+    return MakeOrthographic(-halfW, halfW, -halfH, halfH, 0.1f, 200.0f);
+}
 
-    // Center + auto Scale
+static cy::Matrix4f MakeView(float yaw, float pitch, float dist)
+{
+    cy::Matrix4f R_yaw = cy::Matrix4f::RotationY(yaw);
+    cy::Matrix4f R_pitch = cy::Matrix4f::RotationX(pitch);
+    cy::Matrix4f Tcam = cy::Matrix4f::Translation(cy::Vec3f(0.0f, 0.0f, -dist));
+    return Tcam * R_pitch * R_yaw;
+}
+
+// Object MVP & MV
+static cy::Matrix4f MakeObjectMVP(int fbW, int fbH, float yaw, float pitch, float dist)
+{
+    cy::Matrix4f P = MakeProjection(fbW, fbH, g_usePerspective, g_orthoScale);
+    cy::Matrix4f V = MakeView(yaw, pitch, dist);
     cy::Matrix4f Tcenter = cy::Matrix4f::Translation(-g_objCenter);
-    float scale = g_objScale;
-    if (g_usePerspective)
-    {
-        float d = max(g_dist, 0.001f);
-        scale *= (1.0f / d);
-    }
-    cy::Matrix4f S;
+    cy::Matrix4f S; 
     S.SetScale(g_objScale);
     cy::Matrix4f M = S * Tcenter;
-
     return P * V * M;
 }
 
-static cy::Matrix4f MakeMV()
+static cy::Matrix4f MakeObjectMV(float yaw, float pitch, float dist)
 {
-    cy::Matrix4f R_yaw = cy::Matrix4f::RotationY(g_yaw);
-    cy::Matrix4f R_pitch = cy::Matrix4f::RotationX(g_pitch);
-    cy::Matrix4f Tcam = cy::Matrix4f::Translation(cy::Vec3f(0.0f, 0.0f, -g_dist));
-    cy::Matrix4f V = Tcam * R_pitch * R_yaw;
-
+    cy::Matrix4f V = MakeView(yaw, pitch, dist);
     cy::Matrix4f Tcenter = cy::Matrix4f::Translation(-g_objCenter);
-    cy::Matrix4f S;
+    cy::Matrix4f S; 
     S.SetScale(g_objScale);
-    cy::Matrix4f M = S * Tcenter;
+	cy::Matrix4f M = S * Tcenter;
+    return V * M;
+}
 
+// Plane MVP & MV
+static cy::Matrix4f MakePlaneMVP(int fhW, int fbH, float yaw, float pitch, float dist)
+{
+    cy::Matrix4f P = MakeProjection(fhW, fbH, true, g_orthoScale);
+    cy::Matrix4f V = MakeView(yaw, pitch, dist);
+    cy::Matrix4f M;
+	M.SetIdentity();
+	return P * V;
+}
+
+static cy::Matrix4f MakePlaneMV(float yaw, float pitch, float dist)
+{
+    cy::Matrix4f V = MakeView(yaw, pitch, dist);
+    cy::Matrix4f M;
+    M.SetIdentity();
     return V * M;
 }
 
@@ -208,6 +253,18 @@ static bool BuildShaders(Shader& shader)
     }
 
     std::cout << "[F6] Shader build OK.\n";
+    return true;
+}
+
+static bool BuildPlaneShader(PlaneShader& shader)
+{
+    if (!shader.prog.Build<false, false>(shader.vs, shader.fs))
+    {
+        std::cerr << "Plane shader build failed.\n";
+        return false;
+    }
+    shader.built = true;
+    std::cout << "Plane shader build OK.\n";
     return true;
 }
 
@@ -272,6 +329,24 @@ static std::string ResolveTexPath(const std::string& objPathStr, const char* rel
         p = baseDir / p;
     return p.lexically_normal().string();
 }
+
+static void SetupRTTextureFiltering(GLuint texId)
+{
+	glBindTexture(GL_TEXTURE_2D, texId);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+	GLfloat maxAnisotropy = 1.0f;
+	glGetFloatv(GL_MAX_TEXTURE_MAX_ANISOTROPY, &maxAnisotropy);
+    if (maxAnisotropy > 1.0f)
+    {
+		GLfloat anisotropy = min(16.0f, maxAnisotropy);
+		glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAX_ANISOTROPY, anisotropy);
+    }
+	glBindTexture(GL_TEXTURE_2D, 0);
+}
 // ------------------------------
 
 // Event call back
@@ -302,10 +377,16 @@ static void cursor_pos_callback(GLFWwindow* window, double x, double y)
     const float zoomSpeed = 0.02f;
 
     bool ctrlDown = (glfwGetKey(window, GLFW_KEY_LEFT_CONTROL) == GLFW_PRESS) || (glfwGetKey(window, GLFW_KEY_RIGHT_CONTROL) == GLFW_PRESS);
+	bool altDown = (glfwGetKey(window, GLFW_KEY_LEFT_ALT) == GLFW_PRESS) || (glfwGetKey(window, GLFW_KEY_RIGHT_ALT) == GLFW_PRESS);
+
+    // Decide controlling camera
+	float* yaw = altDown ? &g_planeYaw : &g_yaw;
+	float* pitch = altDown ? &g_planePitch : &g_pitch;
+    float* dist = altDown ? &g_planeDist : &g_dist;
 
     if (g_leftDown)
     {
-        if (ctrlDown)       // Light rotation
+        if (ctrlDown && !altDown)       // Light rotation
         {
             g_lightYaw += (float)dx * rotSpeed;
             g_lightPitch += (float)dy * rotSpeed;
@@ -317,22 +398,22 @@ static void cursor_pos_callback(GLFWwindow* window, double x, double y)
         }
         else        // Camera Rotation
         {
-            g_yaw += (float)dx * rotSpeed;
-            g_pitch += (float)dy * rotSpeed;
+            *yaw += (float)dx * rotSpeed;
+            *pitch += (float)dy * rotSpeed;
             const float limit = 1.55f;      // approximate 89 degrees
-            if (g_pitch > limit)
-                g_pitch = limit;
-            if (g_pitch < -limit)
-                g_pitch = -limit;
+            if (*pitch > limit)
+                *pitch = limit;
+            if (*pitch < -limit)
+                *pitch = -limit;
         }
     }
     if (g_rightDown)
     {
-        g_dist += (float)dy * zoomSpeed;
-        if (g_dist < 0.5)
-            g_dist = 0.5;
-        if (g_dist > 5.0)
-            g_dist = 5.0f;
+        *dist += (float)dy * zoomSpeed;
+        if (*dist < 0.5)
+            *dist = 0.5;
+        if (*dist > 5.0)
+            *dist = 5.0f;
     }
 }
  
@@ -495,7 +576,7 @@ int main(int argc, char** argv)
     // Initialize viewport size
     const int initW = 1280;
     const int initH = 720;
-    GLFWwindow* window = glfwCreateWindow(initW, initH, "Project 4 - Textures", nullptr, nullptr);
+    GLFWwindow* window = glfwCreateWindow(initW, initH, "Project 5 - Render Buffers", nullptr, nullptr);
     if (!window)
     {
         std::cerr << "ERROR: glfwCreateWindow failed\n";
@@ -526,10 +607,58 @@ int main(int argc, char** argv)
     glfwSetWindowUserPointer(window, &shader);
     if (!BuildShaders(shader))
     {
+		std::cerr << "ERROR: shader build failed\n";
         glfwDestroyWindow(window);
         glfwTerminate();
         return -1;
     }
+
+	PlaneShader planeShader;
+    if (!BuildPlaneShader(planeShader))
+    {
+		std::cerr << "ERROR: plane shader build failed\n";
+		glfwDestroyWindow(window);
+		glfwTerminate();
+		return -1;
+    }
+
+	// Render to texture setup (color + depth)
+	cy::GLRenderTexture<GL_TEXTURE_2D> renderTex;
+	int fbW0 = 1024, fbH0 = 1024;
+	glfwGetFramebufferSize(window, &fbW0, &fbH0);
+    if (!renderTex.Initialize(true, 4, (GLsizei)fbW0, (GLsizei)fbH0, cy::GL::TYPE_UBYTE))
+    {
+        std::cerr << "ERROR: render texture initialization failed\n";
+        glfwDestroyWindow(window);
+        glfwTerminate();
+        return -1;
+    }
+	SetupRTTextureFiltering(renderTex.GetTextureID());
+
+	// Plane geometry setup
+	GLuint planeVAO = 0, planeVBO = 0;
+	glCreateVertexArrays(1, &planeVAO);
+	glCreateBuffers(1, &planeVBO);
+
+    const float planeVertices[] = {
+        // positions        // UVs
+        -1.0f, -1.0f, 0.0f,  0.0f, 0.0f,
+         1.0f, -1.0f, 0.0f,  1.0f, 0.0f,
+         1.0f,  1.0f, 0.0f,  1.0f, 1.0f,
+        -1.0f, -1.0f, 0.0f,  0.0f, 0.0f,
+         1.0f,  1.0f, 0.0f,  1.0f, 1.0f,
+        -1.0f,  1.0f, 0.0f,  0.0f, 1.0f
+	};
+	glNamedBufferData(planeVBO, sizeof(planeVertices), planeVertices, GL_STATIC_DRAW);
+	glVertexArrayVertexBuffer(planeVAO, 0, planeVBO, 0, 5 * sizeof(float));
+	glEnableVertexArrayAttrib(planeVAO, 0);
+	glVertexArrayAttribFormat(planeVAO, 0, 3, GL_FLOAT, GL_FALSE, 0);
+	glVertexArrayAttribBinding(planeVAO, 0, 0);
+	glEnableVertexArrayAttrib(planeVAO, 1);
+	glVertexArrayAttribFormat(planeVAO, 1, 2, GL_FLOAT, GL_FALSE, 3 * sizeof(float));
+	glVertexArrayAttribBinding(planeVAO, 1, 0);
+
+	g_planeDist = 2.5f;
 
     // Build GPU Materials
     std::vector<GPUMaterial> gpuMtls;
@@ -673,16 +802,30 @@ int main(int argc, char** argv)
         int fbW = 0, fbH = 0;
         glfwGetFramebufferSize(window, &fbW, &fbH);
 
-        cy::Matrix4f MVP = MakeMVP(fbW, fbH);
-        cy::Matrix4f MV = MakeMV();
+		static int lastRTW = 0, lastRTH = 0;
+        if (fbW != lastRTW || fbH != lastRTH)
+        {
+			lastRTW = fbW;
+            lastRTH = fbH;
+            renderTex.Resize(4, (GLsizei)fbW, (GLsizei)fbH, cy::GL::TYPE_UBYTE);
+			SetupRTTextureFiltering(renderTex.GetTextureID());
+        }
 
+        // Pass 1: render Obj -> texture
+		renderTex.Bind();
+		glViewport(0, 0, fbW, fbH);
+        glEnable(GL_DEPTH_TEST);
         glClearColor(0.08f, 0.08f, 0.10f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
+		cy::Matrix4f objMVP = MakeObjectMVP(fbW, fbH, g_yaw, g_pitch, g_dist);
+		cy::Matrix4f objMV = MakeObjectMV(g_yaw, g_pitch, g_dist);
+
         shader.prog.Bind();
-        shader.prog.SetUniformMatrix4("uMVP", MVP.cell);
-        shader.prog.SetUniformMatrix4("uMV", MV.cell);
+        shader.prog.SetUniformMatrix4("uMVP", objMVP.cell);
+        shader.prog.SetUniformMatrix4("uMV", objMV.cell);
         shader.prog.SetUniform("uVisMode", g_visMode);
+
         cy::Vec3f lightPosV = ComputeLightPosViewSpace(g_yaw, g_pitch, g_dist, g_lightYaw, g_lightPitch, g_lightRadius);
         shader.prog.SetUniform("uLightPosV", lightPosV.x, lightPosV.y, lightPosV.z);
 
@@ -739,6 +882,29 @@ int main(int argc, char** argv)
 
             glDrawArrays(GL_TRIANGLES, 0, (GLsizei)(mesh.NF() * 3));
         }
+        
+		renderTex.Unbind();
+
+        glBindTexture(GL_TEXTURE_2D, renderTex.GetTextureID());
+		glGenerateMipmap(GL_TEXTURE_2D);
+		glBindTexture(GL_TEXTURE_2D, 0);
+
+		// Pass 2: render plane -> framebuffer
+		glViewport(0, 0, fbW, fbH);
+        glEnable(GL_DEPTH_TEST);
+        glClearColor(0.06f, 0.06f, 0.08f, 1.0f);
+		glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+		cy::Matrix4f planeMVP = MakePlaneMVP(fbW, fbH, g_planeYaw, g_planePitch, g_planeDist);
+
+		planeShader.prog.Bind();
+		planeShader.prog.SetUniformMatrix4("uMVP", planeMVP.cell);
+        planeShader.prog.SetUniform("uTex", 0);
+        planeShader.prog.SetUniform("uAdd", 0.03f, 0.03f, 0.03f);
+
+		glBindTextureUnit(0, renderTex.GetTextureID());
+		glBindVertexArray(planeVAO);
+		glDrawArrays(GL_TRIANGLES, 0, 6);
 
         glfwSwapBuffers(window);
         glfwPollEvents();
@@ -750,6 +916,8 @@ int main(int argc, char** argv)
         if (m.texKd) glDeleteTextures(1, &m.texKd);
         if (m.texKs) glDeleteTextures(1, &m.texKs);
     }
+	glDeleteBuffers(1, &planeVBO);
+    glDeleteVertexArrays(1, &planeVAO);
     glDeleteBuffers(1, &tbo);
     glDeleteBuffers(1, &nbo);
     glDeleteBuffers(1, &vbo);
