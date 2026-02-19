@@ -17,8 +17,8 @@ void main()
     vPosV = posV.xyz;
     mat3 normalMat = transpose(inverse(mat3(uMV)));
     vNormalV = normalMat * aNormal;
-    vUV = aUV;
-    //vUV = vec2(aUV.x, 1.0 - aUV.y);
+    vUV = vec2(aUV.x, 1.0 - aUV.y);
+    //vUV = aUV;
 
     gl_Position = uMVP * vec4(aPos, 1.0);
 }

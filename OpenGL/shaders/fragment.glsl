@@ -36,7 +36,7 @@ void main()
     vec3 kdTex = uHasDiffuseTex ? texture(uDiffuseTex, vUV).rgb : vec3(1.0);
     vec3 ksTex = uHasSpecularTex ? texture(uSpecularTex, vUV).rgb : vec3(1.0);
 
-    // Simple Blinn-Phong defaults from .mtl
+    // Simple Blinn-Phong from .mtl
     vec3 Ka = uKa;
     vec3 Kd = uHasDiffuseTex ? kdTex : uKd;
     vec3 Ks = uKs * ksTex;
