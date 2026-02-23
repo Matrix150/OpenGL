@@ -1,4 +1,5 @@
-#include <iostream>
+﻿#include <iostream>
+#include <array>
 
 #include <glad/glad.h>
 #include <GLFW/glfw3.h>
@@ -67,7 +68,7 @@ struct GPUMaterial
 
 
 // Shader
-struct  Shader
+struct Shader
 {
     cy::GLSLProgram prog;
     bool reloadShaders = false;
@@ -89,7 +90,7 @@ struct  Shader
     )GLSL";
 
     const char* fsFallback = R"GLSL(
-               #version 460 core
+        #version 460 core
         out vec4 FragColor;
         void main()
         {
@@ -112,7 +113,7 @@ struct PlaneShader
         out vec2 vUV;
         void main()
         {
-            vUV = aUV;
+            vUV = vec2(aUV.x, 1.0 - aUV.y);
             gl_Position = uMVP * vec4(aPos, 1.0);
         }
     )GLSL";
@@ -126,6 +127,85 @@ struct PlaneShader
         {
             vec3 c = texture(uTex, vUV).rgb + uAdd;   // small constant to separate from background
             FragColor = vec4(clamp(c, 0.0, 1.0), 1.0);
+        }
+    )GLSL";
+};
+
+struct SkyboxShader
+{
+    cy::GLSLProgram prog;
+    bool built = false;
+    const char* vs = R"GLSL(
+        #version 460 core
+        layout(location=0) in vec3 aPos;
+        out vec3 vDirW;
+        uniform mat4 uProj;
+        uniform mat4 uView; 
+        void main()
+        {
+            vDirW = aPos;
+            vec4 pos = uProj * uView * vec4(aPos, 1.0);
+            gl_Position = pos.xyww;
+        }
+    )GLSL";
+    const char* fs = R"GLSL(
+        #version 460 core
+        in vec3 vDirW;
+        out vec4 FragColor;
+        uniform samplerCube uEnv;
+        void main()
+        {
+            vec3 dir = normalize(vDirW);
+            vec3 c = texture(uEnv, dir).rgb;
+            FragColor = vec4(c, 1.0);
+        }
+    )GLSL";
+};
+
+struct ReflectShader
+{
+    cy::GLSLProgram prog;
+    bool built = false;    
+    const char* vs = R"GLSL(
+        #version 460 core
+        layout(location=0) in vec3 aPos;
+        layout(location=2) in vec2 aUV;
+        uniform mat4 uM;
+        uniform mat4 uV;
+        uniform mat4 uP;
+        out vec4 vWorldPos;
+        void main()
+        {
+            vWorldPos = uM * vec4(aPos, 1.0);
+            gl_Position = uP * uV * vWorldPos;
+        }
+    )GLSL";
+    const char* fs = R"GLSL(
+        #version 460 core
+        in vec4 vWorldPos;
+        out vec4 FragColor;
+        uniform mat4 uVref;
+        uniform mat4 uPref;
+        uniform sampler2D uReflectionTex;
+        uniform vec3 uCamPosW;
+        uniform vec3 uFadeCenterW;
+        uniform float uFadeRadius;
+        uniform float uReflectOpacity;
+        void main()
+        {
+            vec4 clip = uPref * uVref * vWorldPos;
+            vec2 uv = (clip.xy / clip.w) * 0.5 + 0.5;
+            float inside = step(0.0, uv.x) * step(uv.x, 1.0) * step(0.0, uv.y) * step(uv.y, 1.0);
+            vec3 planar = texture(uReflectionTex, clamp(uv, 0.0, 1.0)).rgb;
+            // Fresnel based on plane normal (0,1,0)
+            vec3 N = vec3(0,1,0);
+            vec3 V = normalize(uCamPosW - vWorldPos.xyz);
+            float F = pow(1.0 - max(dot(N, V), 0.0), 5.0);
+            // Distance Fade on XZ
+            float d = distance(vWorldPos.xz, uFadeCenterW.xz);
+            float fade = 1.0 - smoothstep(0.0, uFadeRadius, d);
+            float alpha = uReflectOpacity * inside * (0.15 + 0.85*F) * fade;
+            FragColor = vec4(planar, alpha);
         }
     )GLSL";
 };
@@ -268,6 +348,30 @@ static bool BuildPlaneShader(PlaneShader& shader)
     return true;
 }
 
+static bool BuildSkyboxShader(SkyboxShader& shader)
+{
+    if (!shader.prog.Build<false, false>(shader.vs, shader.fs))
+    {
+        std::cerr << "Skybox shader build failed.\n";
+        return false;
+    }
+    shader.built = true;
+    std::cout << "Skybox shader build OK.\n";
+    return true;
+}
+
+static bool BuildReflectShader(ReflectShader& shader)
+{
+    if (!shader.prog.Build<false, false>(shader.vs, shader.fs))
+    {
+        std::cerr << "Reflection shader build failed.\n";
+        return false;
+    }
+    shader.built = true;
+    std::cout << "Reflection shader build OK.\n";
+    return true;
+}
+
 static cy::Vec3f ComputeLightPosViewSpace(float camYaw, float camPitch, float camDist, float lightYaw, float lightPitch, float lightRadius)
 {
     // View Matrix (V)
@@ -318,6 +422,55 @@ static GLuint CreateTexture2D(unsigned w, unsigned h, const unsigned char* rgba)
 	return tex;
 }
 
+// OpenGL faces order: +X, -X, +Y, -Y, +Z, -Z
+static GLuint CreateCubemapFromPNG(const std::array<std::string, 6>& faces)
+{
+    std::vector<unsigned char> rgba0;
+    unsigned w0 = 0, h0 = 0;
+    if (!LoadPNGTexture(faces[0], rgba0, w0, h0))
+    {
+        std::cerr << "Failed to load cubemap face: " << faces[0] << "\n";
+        return 0;
+    }
+
+    GLuint tex = 0;
+    glCreateTextures(GL_TEXTURE_CUBE_MAP, 1, &tex);
+    glTextureStorage2D(tex, 1, GL_RGBA8, (GLsizei)w0, (GLsizei)h0);
+
+    auto uploadFace = [&](int FaceIndex, const std::string& path) {
+        std::vector<unsigned char> rgba;
+        unsigned w = 0, h = 0;
+        if (!LoadPNGTexture(path, rgba, w, h))
+        {
+            std::cerr << "Failed to load cubemap face: " << path << "\n";
+            return false;
+        };
+        if (w != w0 || h != h0)
+        {
+            std::cerr << "Cubemap face size mismatch: " << path << " (expected " << w0 << "x" << h0 << ", got " << w << "x" << h << ")\n";
+            return false;
+        }
+        glTextureSubImage3D(tex, 0, 0, 0, FaceIndex, (GLsizei)w, (GLsizei)h, 1, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+        return true;
+        };
+
+    for (int i = 0; i < 6; ++i)
+    {
+        if (!uploadFace(i, faces[i]))
+        {
+            glDeleteTextures(1, &tex);
+			return 0;
+        }
+    }
+
+	glTextureParameteri(tex, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+	glTextureParameteri(tex, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	glTextureParameteri(tex, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTextureParameteri(tex, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTextureParameteri(tex, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
+	return tex;
+}
+
 static std::string ResolveTexPath(const std::string& objPathStr, const char* rel)
 {
     if (!rel || rel[0] == '\0') 
@@ -334,7 +487,8 @@ static void SetupRTTextureFiltering(GLuint texId)
 {
 	glBindTexture(GL_TEXTURE_2D, texId);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    //glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
@@ -485,7 +639,7 @@ int main(int argc, char** argv)
         return -1;
     }
 
-	// Get vertices & bounding box & center & scale
+    // Get vertices & bounding box & center & scale
     cy::Vec3f bbMin(1e30f, 1e30f, 1e30f);
     cy::Vec3f bbMax(-1e30f, -1e30f, -1e30f);
     for (unsigned int i = 0; i < mesh.NV(); ++i)
@@ -513,25 +667,25 @@ int main(int argc, char** argv)
     g_orthoScale = 1.5f;
 
     mesh.ComputeNormals();
-	const bool hasUV = mesh.HasTextureVertices();
+    const bool hasUV = mesh.HasTextureVertices();
 
-	std::vector<float> positions;
+    std::vector<float> positions;
     positions.reserve(mesh.NF() * 3 * 3);
-	std::vector<float> normals;
-	normals.reserve(mesh.NF() * 3 * 3);
-	std::vector<float> uvs;
-	uvs.reserve(mesh.NF() * 3 * 2);
+    std::vector<float> normals;
+    normals.reserve(mesh.NF() * 3 * 3);
+    std::vector<float> uvs;
+    uvs.reserve(mesh.NF() * 3 * 2);
 
     for (unsigned int fi = 0; fi < mesh.NF(); ++fi)
     {
         auto f = mesh.F((int)fi);
-		auto fn = mesh.FN((int)fi);
-		auto ft = hasUV ? mesh.FT((int)fi) : cy::TriMesh::TriFace();
+        auto fn = mesh.FN((int)fi);
+        auto ft = hasUV ? mesh.FT((int)fi) : cy::TriMesh::TriFace();
 
         for (int c = 0; c < 3; ++c)
         {
             int vi = f.v[c];
-			int ni = fn.v[c];
+            int ni = fn.v[c];
             cy::Vec3f p = mesh.V(vi);
             cy::Vec3f n = (mesh.NVN() > 0 && ni >= 0) ? mesh.VN(ni) : cy::Vec3f(0, 1, 0);
 
@@ -560,7 +714,7 @@ int main(int argc, char** argv)
     }
 
     //const GLsizei drawVertexCount = (GLsizei)(mesh.NF() * 3);
-    
+
     // GLFW
     if (!glfwInit())
     {
@@ -576,7 +730,7 @@ int main(int argc, char** argv)
     // Initialize viewport size
     const int initW = 1280;
     const int initH = 720;
-    GLFWwindow* window = glfwCreateWindow(initW, initH, "Project 5 - Render Buffers", nullptr, nullptr);
+    GLFWwindow* window = glfwCreateWindow(initW, initH, "Project 6 - Environment Mapping", nullptr, nullptr);
     if (!window)
     {
         std::cerr << "ERROR: glfwCreateWindow failed\n";
@@ -607,25 +761,79 @@ int main(int argc, char** argv)
     glfwSetWindowUserPointer(window, &shader);
     if (!BuildShaders(shader))
     {
-		std::cerr << "ERROR: shader build failed\n";
+        std::cerr << "ERROR: shader build failed\n";
         glfwDestroyWindow(window);
         glfwTerminate();
         return -1;
     }
 
-	PlaneShader planeShader;
+    PlaneShader planeShader;
     if (!BuildPlaneShader(planeShader))
     {
-		std::cerr << "ERROR: plane shader build failed\n";
-		glfwDestroyWindow(window);
-		glfwTerminate();
-		return -1;
+        std::cerr << "ERROR: plane shader build failed\n";
+        glfwDestroyWindow(window);
+        glfwTerminate();
+        return -1;
     }
 
-	// Render to texture setup (color + depth)
-	cy::GLRenderTexture<GL_TEXTURE_2D> renderTex;
-	int fbW0 = 1024, fbH0 = 1024;
-	glfwGetFramebufferSize(window, &fbW0, &fbH0);
+    SkyboxShader skyboxShader;
+    if (!BuildSkyboxShader(skyboxShader))
+    {
+        std::cerr << "ERROR: skybox shader build failed\n";
+        glfwDestroyWindow(window);
+        glfwTerminate();
+        return -1;
+    }
+
+    ReflectShader reflectShader;
+    if (!BuildReflectShader(reflectShader))
+    {
+        std::cerr << "ERROR: reflection shader build failed\n";
+        glfwDestroyWindow(window);
+        glfwTerminate();
+        return -1;
+    }
+
+    // Cubemap Setup
+    std::array<std::string, 6> cubemapFaces = {
+        "assets/cubemap/cubemap_posx.png",
+        "assets/cubemap/cubemap_negx.png",
+        "assets/cubemap/cubemap_posy.png",
+        "assets/cubemap/cubemap_negy.png",
+        "assets/cubemap/cubemap_posz.png",
+        "assets/cubemap/cubemap_negz.png"
+    };
+    GLuint cubemapTex = CreateCubemapFromPNG(cubemapFaces);
+    if (!cubemapTex)
+    {
+        std::cerr << "ERROR: env cubemap creation failed\n";
+        return -1;
+    }
+
+    // Skybox Cube setup (for rendering cubemap background)
+    GLuint skyboxVAO = 0, skyboxVBO = 0;
+    glCreateVertexArrays(1, &skyboxVAO);
+    glCreateBuffers(1, &skyboxVBO);
+    static const float skyboxVerts[] = {
+        // ... 36 vertices (pos only)
+        -1,  1, -1,  -1, -1, -1,   1, -1, -1,   1, -1, -1,   1,  1, -1,  -1,  1, -1,
+        -1, -1,  1,  -1, -1, -1,  -1,  1, -1,  -1,  1, -1,  -1,  1,  1,  -1, -1,  1,
+         1, -1, -1,   1, -1,  1,   1,  1,  1,   1,  1,  1,   1,  1, -1,   1, -1, -1,
+        -1, -1,  1,  -1,  1,  1,   1,  1,  1,   1,  1,  1,   1, -1,  1,  -1, -1,  1,
+        -1,  1, -1,   1,  1, -1,   1,  1,  1,   1,  1,  1,  -1,  1,  1,  -1,  1, -1,
+        -1, -1, -1,  -1, -1,  1,   1, -1, -1,   1, -1, -1,  -1, -1,  1,   1, -1,  1
+    };
+
+    glNamedBufferData(skyboxVBO, sizeof(skyboxVerts), skyboxVerts, GL_STATIC_DRAW);
+    glVertexArrayVertexBuffer(skyboxVAO, 0, skyboxVBO, 0, 3 * sizeof(float));
+    glEnableVertexArrayAttrib(skyboxVAO, 0);
+    glVertexArrayAttribFormat(skyboxVAO, 0, 3, GL_FLOAT, GL_FALSE, 0);
+    glVertexArrayAttribBinding(skyboxVAO, 0, 0);
+
+    // Render to texture setup (color + depth)
+    cy::GLRenderTexture<GL_TEXTURE_2D> renderTex;
+    int fbW0 = 1024, fbH0 = 1024;
+    glfwGetFramebufferSize(window, &fbW0, &fbH0);
     if (!renderTex.Initialize(true, 4, (GLsizei)fbW0, (GLsizei)fbH0, cy::GL::TYPE_UBYTE))
     {
         std::cerr << "ERROR: render texture initialization failed\n";
@@ -633,12 +841,12 @@ int main(int argc, char** argv)
         glfwTerminate();
         return -1;
     }
-	SetupRTTextureFiltering(renderTex.GetTextureID());
+    SetupRTTextureFiltering(renderTex.GetTextureID());
 
-	// Plane geometry setup
-	GLuint planeVAO = 0, planeVBO = 0;
-	glCreateVertexArrays(1, &planeVAO);
-	glCreateBuffers(1, &planeVBO);
+    // Plane geometry setup (Render texture)
+    GLuint planeVAO = 0, planeVBO = 0;
+    glCreateVertexArrays(1, &planeVAO);
+    glCreateBuffers(1, &planeVBO);
 
     const float planeVertices[] = {
         // positions        // UVs
@@ -648,38 +856,66 @@ int main(int argc, char** argv)
         -1.0f, -1.0f, 0.0f,  0.0f, 0.0f,
          1.0f,  1.0f, 0.0f,  1.0f, 1.0f,
         -1.0f,  1.0f, 0.0f,  0.0f, 1.0f
-	};
-	glNamedBufferData(planeVBO, sizeof(planeVertices), planeVertices, GL_STATIC_DRAW);
-	glVertexArrayVertexBuffer(planeVAO, 0, planeVBO, 0, 5 * sizeof(float));
-	glEnableVertexArrayAttrib(planeVAO, 0);
-	glVertexArrayAttribFormat(planeVAO, 0, 3, GL_FLOAT, GL_FALSE, 0);
-	glVertexArrayAttribBinding(planeVAO, 0, 0);
-	glEnableVertexArrayAttrib(planeVAO, 1);
-	glVertexArrayAttribFormat(planeVAO, 1, 2, GL_FLOAT, GL_FALSE, 3 * sizeof(float));
-	glVertexArrayAttribBinding(planeVAO, 1, 0);
+    };
+    glNamedBufferData(planeVBO, sizeof(planeVertices), planeVertices, GL_STATIC_DRAW);
+    glVertexArrayVertexBuffer(planeVAO, 0, planeVBO, 0, 5 * sizeof(float));
+    glEnableVertexArrayAttrib(planeVAO, 0);
+    glVertexArrayAttribFormat(planeVAO, 0, 3, GL_FLOAT, GL_FALSE, 0);
+    glVertexArrayAttribBinding(planeVAO, 0, 0);
+    glEnableVertexArrayAttrib(planeVAO, 1);
+    glVertexArrayAttribFormat(planeVAO, 1, 2, GL_FLOAT, GL_FALSE, 3 * sizeof(float));
+    glVertexArrayAttribBinding(planeVAO, 1, 0);
 
-	g_planeDist = 2.5f;
+    g_planeDist = 2.5f;
+
+    // Environment Reflection Plane setup (underneath the object)
+    GLuint reflPlaneVAO = 0, reflPlaneVBO = 0;
+    glCreateVertexArrays(1, &reflPlaneVAO);
+    glCreateBuffers(1, &reflPlaneVBO);
+
+    float size = 1.0f;
+    const float reflPlaneVerts[] = {
+        // positions            normals        UV
+        -size, 0, -size,        0,1,0,         0,0,
+         size, 0, -size,        0,1,0,         1,0,
+         size, 0,  size,        0,1,0,         1,1,
+
+        -size, 0, -size,        0,1,0,         0,0,
+         size, 0,  size,        0,1,0,         1,1,
+        -size, 0,  size,        0,1,0,         0,1,
+    };
+    glNamedBufferData(reflPlaneVBO, sizeof(reflPlaneVerts), reflPlaneVerts, GL_STATIC_DRAW);
+    glVertexArrayVertexBuffer(reflPlaneVAO, 0, reflPlaneVBO, 0, 8 * sizeof(float));
+    glEnableVertexArrayAttrib(reflPlaneVAO, 0);
+    glVertexArrayAttribFormat(reflPlaneVAO, 0, 3, GL_FLOAT, GL_FALSE, 0);
+    glVertexArrayAttribBinding(reflPlaneVAO, 0, 0);
+    glEnableVertexArrayAttrib(reflPlaneVAO, 1);
+    glVertexArrayAttribFormat(reflPlaneVAO, 1, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float));
+    glVertexArrayAttribBinding(reflPlaneVAO, 1, 0);
+    glEnableVertexArrayAttrib(reflPlaneVAO, 2);
+    glVertexArrayAttribFormat(reflPlaneVAO, 2, 2, GL_FLOAT, GL_FALSE, 6 * sizeof(float));
+    glVertexArrayAttribBinding(reflPlaneVAO, 2, 0);
 
     // Build GPU Materials
     std::vector<GPUMaterial> gpuMtls;
     if (mesh.NM() > 0)
     {
-	    gpuMtls.resize(mesh.NM());
+        gpuMtls.resize(mesh.NM());
 
         for (unsigned int mi = 0; mi < mesh.NM(); ++mi)
         {
-		    const auto& mtl = mesh.M((int)mi);
-		    GPUMaterial gpuMtl;
-		    gpuMtl.Ka = cy::Vec3f(mtl.Ka[0], mtl.Ka[1], mtl.Ka[2]);
-		    gpuMtl.Kd = cy::Vec3f(mtl.Kd[0], mtl.Kd[1], mtl.Kd[2]);
-		    gpuMtl.Ks = cy::Vec3f(mtl.Ks[0], mtl.Ks[1], mtl.Ks[2]);
-		    gpuMtl.Tf = cy::Vec3f(mtl.Tf[0], mtl.Tf[1], mtl.Tf[2]);
-		    gpuMtl.Ns = mtl.Ns;
-		    gpuMtl.Ni = mtl.Ni;
-		    gpuMtl.illum = mtl.illum;
+            const auto& mtl = mesh.M((int)mi);
+            GPUMaterial gpuMtl;
+            gpuMtl.Ka = cy::Vec3f(mtl.Ka[0], mtl.Ka[1], mtl.Ka[2]);
+            gpuMtl.Kd = cy::Vec3f(mtl.Kd[0], mtl.Kd[1], mtl.Kd[2]);
+            gpuMtl.Ks = cy::Vec3f(mtl.Ks[0], mtl.Ks[1], mtl.Ks[2]);
+            gpuMtl.Tf = cy::Vec3f(mtl.Tf[0], mtl.Tf[1], mtl.Tf[2]);
+            gpuMtl.Ns = mtl.Ns;
+            gpuMtl.Ni = mtl.Ni;
+            gpuMtl.illum = mtl.illum;
 
             // map_kd
-		    std::string kdPath = ResolveTexPath(argv[1], mtl.map_Kd.data);
+            std::string kdPath = ResolveTexPath(argv[1], mtl.map_Kd.data);
             if (!kdPath.empty())
             {
                 std::vector<unsigned char> rgba;
@@ -687,26 +923,26 @@ int main(int argc, char** argv)
                 if (LoadPNGTexture(kdPath, rgba, w, h))
                 {
                     gpuMtl.texKd = CreateTexture2D(w, h, rgba.data());
-				    gpuMtl.hasKd = (gpuMtl.texKd != 0);
+                    gpuMtl.hasKd = (gpuMtl.texKd != 0);
                     std::cout << "Material " << mi << " map_Kd: " << kdPath << "\n";
                 }
             }
 
             // map_Ks
-		    std::string ksPath = ResolveTexPath(argv[1], mtl.map_Ks.data);
+            std::string ksPath = ResolveTexPath(argv[1], mtl.map_Ks.data);
             if (!ksPath.empty())
             {
                 std::vector<unsigned char> rgba;
                 unsigned w = 0, h = 0;
                 if (LoadPNGTexture(ksPath, rgba, w, h))
                 {
-				    gpuMtl.texKs = CreateTexture2D(w, h, rgba.data());
+                    gpuMtl.texKs = CreateTexture2D(w, h, rgba.data());
                     gpuMtl.hasKs = (gpuMtl.texKs != 0);
                     std::cout << "Material " << mi << " map_Ks: " << ksPath << "\n";
                 }
             }
 
-		    gpuMtls[mi] = gpuMtl;
+            gpuMtls[mi] = gpuMtl;
         }
     }
     else    // No materials in OBJ/MTL
@@ -720,49 +956,13 @@ int main(int argc, char** argv)
     glCreateBuffers(1, &nbo);
     glCreateBuffers(1, &tbo);
 
-    glNamedBufferData(
-        vbo,
-        (GLsizeiptr)(positions.size() * sizeof(float)),
-        positions.data(),
-        GL_STATIC_DRAW
-    );
-
-    glNamedBufferData(
-        nbo,
-        (GLsizeiptr)(normals.size() * sizeof(float)),
-        normals.data(),
-        GL_STATIC_DRAW
-    );
-
-    glNamedBufferData(
-        tbo,
-        (GLsizeiptr)(uvs.size() * sizeof(float)),
-        uvs.data(),
-        GL_STATIC_DRAW
-    );
-
-    glVertexArrayVertexBuffer(
-        vao,        // VAO
-        0,          // binding index
-        vbo,        // buffer
-        0,          // offset
-        3 * sizeof(float) // stride
-    );
+    glNamedBufferData(vbo, (GLsizeiptr)(positions.size() * sizeof(float)), positions.data(), GL_STATIC_DRAW);
+    glNamedBufferData(nbo, (GLsizeiptr)(normals.size() * sizeof(float)), normals.data(), GL_STATIC_DRAW);
+    glNamedBufferData(tbo, (GLsizeiptr)(uvs.size() * sizeof(float)), uvs.data(), GL_STATIC_DRAW);
+    glVertexArrayVertexBuffer(vao, 0, vbo, 0, 3 * sizeof(float));
     // Normal buffer at binding=1
-    glVertexArrayVertexBuffer(
-        vao,
-        1,
-        nbo,
-        0,
-        3 * sizeof(float)
-    );
-    glVertexArrayVertexBuffer(
-        vao, 
-        2, 
-        tbo, 
-        0, 
-        2 * sizeof(float)
-    );
+    glVertexArrayVertexBuffer(vao, 1, nbo, 0, 3 * sizeof(float));
+    glVertexArrayVertexBuffer(vao, 2, tbo, 0, 2 * sizeof(float));
 
     glEnableVertexArrayAttrib(vao, 0);
     glVertexArrayAttribFormat(vao, 0, 3, GL_FLOAT, GL_FALSE, 0);
@@ -797,56 +997,93 @@ int main(int argc, char** argv)
         {
             shader.reloadShaders = false;
             BuildShaders(shader);
+            BuildSkyboxShader(skyboxShader);
+            BuildReflectShader(reflectShader);
         }
 
         int fbW = 0, fbH = 0;
         glfwGetFramebufferSize(window, &fbW, &fbH);
 
-		static int lastRTW = 0, lastRTH = 0;
+        static int lastRTW = 0, lastRTH = 0;
         if (fbW != lastRTW || fbH != lastRTH)
         {
-			lastRTW = fbW;
+            lastRTW = fbW;
             lastRTH = fbH;
             renderTex.Resize(4, (GLsizei)fbW, (GLsizei)fbH, cy::GL::TYPE_UBYTE);
-			SetupRTTextureFiltering(renderTex.GetTextureID());
+            SetupRTTextureFiltering(renderTex.GetTextureID());
         }
 
-        // Pass 1: render Obj -> texture
-		renderTex.Bind();
-		glViewport(0, 0, fbW, fbH);
+        // Matrices
+        cy::Matrix4f P = MakeProjection(fbW, fbH, g_usePerspective, g_orthoScale);
+        cy::Matrix4f V = MakeView(g_yaw, g_pitch, g_dist);
+
+        // Camera world position
+        cy::Matrix4f Vinv = V.GetInverse();
+        cy::Vec4f camPos4 = Vinv * cy::Vec4f(0, 0, 0, 1);
+        cy::Vec3f camPosW(camPos4.x, camPos4.y, camPos4.z);
+
+        // Light world position
+        cy::Vec3f lightPosW; {
+            float ly = sinf(g_lightPitch) * g_lightRadius;
+            float lxz = cosf(g_lightPitch) * g_lightRadius;
+            float lx = sinf(g_lightYaw) * lxz;
+            float lz = cosf(g_lightYaw) * lxz;
+            lightPosW = cy::Vec3f(lx, ly, lz);
+        }
+
+        // Model matrix
+        cy::Matrix4f Tcenter = cy::Matrix4f::Translation(-g_objCenter);
+        cy::Matrix4f Tup = cy::Matrix4f::Translation(cy::Vec3f(0.0f, 0.5f, 0.0f));      // Make teapot above the plane
+        cy::Matrix4f S;
+        S.SetScale(g_objScale);
+        cy::Matrix4f M = Tup * S * Tcenter;
+
+        // Mirror Matrix
+        cy::Matrix4f MirrorY;
+        MirrorY.SetIdentity();
+        MirrorY(1, 1) = -1.0f;     // Mirror across XZ plane (Y=0)
+
+        // Pass 1: render teapot (mirrored) -> render texture
+        renderTex.Bind();
+        //glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        glViewport(0, 0, fbW, fbH);
         glEnable(GL_DEPTH_TEST);
-        glClearColor(0.08f, 0.08f, 0.10f, 1.0f);
+        glClearColor(0, 0, 0, 0);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
-		cy::Matrix4f objMVP = MakeObjectMVP(fbW, fbH, g_yaw, g_pitch, g_dist);
-		cy::Matrix4f objMV = MakeObjectMV(g_yaw, g_pitch, g_dist);
+        glDisable(GL_CULL_FACE);
+
+        cy::Matrix4f Vref = MakeView(g_yaw, -g_pitch, g_dist);
 
         shader.prog.Bind();
-        shader.prog.SetUniformMatrix4("uMVP", objMVP.cell);
-        shader.prog.SetUniformMatrix4("uMV", objMV.cell);
-        shader.prog.SetUniform("uVisMode", g_visMode);
+        shader.prog.SetUniformMatrix4("uM", M.cell);
+        shader.prog.SetUniformMatrix4("uV", Vref.cell);
+        shader.prog.SetUniformMatrix4("uP", P.cell);
+        shader.prog.SetUniform("uCamPosW", camPosW.x, camPosW.y, camPosW.z);
+        shader.prog.SetUniform("uLightPosW", lightPosW.x, lightPosW.y, lightPosW.z);
+        shader.prog.SetUniform("uEnvMap", 2);
+        glBindTextureUnit(2, cubemapTex);
 
-        cy::Vec3f lightPosV = ComputeLightPosViewSpace(g_yaw, g_pitch, g_dist, g_lightYaw, g_lightPitch, g_lightRadius);
-        shader.prog.SetUniform("uLightPosV", lightPosV.x, lightPosV.y, lightPosV.z);
-
-        // Texture units
+        shader.prog.SetUniform("uReflectStrength", 0.2f);
+        shader.prog.SetUniform("uRefractStrength", 0.0f);
+        shader.prog.SetUniform("uVisMode", 0);
         shader.prog.SetUniform("uDiffuseTex", 0);
         shader.prog.SetUniform("uSpecularTex", 1);
+
         glBindVertexArray(vao);
 
-		// Support multiple materials
+        // Multiuple materials
         if (mesh.NM() > 0)
         {
             for (unsigned int mi = 0; mi < mesh.NM(); ++mi)
             {
                 int firstFace = mesh.GetMaterialFirstFace((int)mi);
                 int faceCount = mesh.GetMaterialFaceCount((int)mi);
-                if (faceCount <= 0) 
+                if (faceCount <= 0)
                     continue;
 
                 const GPUMaterial& m = gpuMtls[mi];
 
-				// Set material properties
                 shader.prog.SetUniform("uKa", m.Ka.x, m.Ka.y, m.Ka.z);
                 shader.prog.SetUniform("uKd", m.Kd.x, m.Kd.y, m.Kd.z);
                 shader.prog.SetUniform("uKs", m.Ks.x, m.Ks.y, m.Ks.z);
@@ -855,7 +1092,6 @@ int main(int argc, char** argv)
                 shader.prog.SetUniform("uNi", m.Ni);
                 shader.prog.SetUniform("uIllum", m.illum);
 
-                // Binding Texture (unit0 = kd, unit1 = ks)
                 glBindTextureUnit(0, m.texKd);
                 glBindTextureUnit(1, m.texKs);
                 shader.prog.SetUniform("uHasDiffuseTex", m.hasKd);
@@ -864,7 +1100,7 @@ int main(int argc, char** argv)
                 glDrawArrays(GL_TRIANGLES, firstFace * 3, faceCount * 3);
             }
         }
-		else    // If no material
+        else
         {
             const GPUMaterial& m = gpuMtls[0];
             shader.prog.SetUniform("uKa", m.Ka.x, m.Ka.y, m.Ka.z);
@@ -882,41 +1118,176 @@ int main(int argc, char** argv)
 
             glDrawArrays(GL_TRIANGLES, 0, (GLsizei)(mesh.NF() * 3));
         }
-        
-		renderTex.Unbind();
 
-        glBindTexture(GL_TEXTURE_2D, renderTex.GetTextureID());
-		glGenerateMipmap(GL_TEXTURE_2D);
-		glBindTexture(GL_TEXTURE_2D, 0);
-
-		// Pass 2: render plane -> framebuffer
-		glViewport(0, 0, fbW, fbH);
+        // Pass 2: Render scene (skybox + object)
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        glViewport(0, 0, fbW, fbH);
         glEnable(GL_DEPTH_TEST);
-        glClearColor(0.06f, 0.06f, 0.08f, 1.0f);
-		glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        glClearColor(0.08f, 0.08f, 0.10f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
-		cy::Matrix4f planeMVP = MakePlaneMVP(fbW, fbH, g_planeYaw, g_planePitch, g_planeDist);
+        //Draw skybox
+        glDepthFunc(GL_LEQUAL);
+        glDepthMask(GL_FALSE);
 
-		planeShader.prog.Bind();
-		planeShader.prog.SetUniformMatrix4("uMVP", planeMVP.cell);
-        planeShader.prog.SetUniform("uTex", 0);
-        planeShader.prog.SetUniform("uAdd", 0.03f, 0.03f, 0.03f);
+        cy::Matrix4f VnoT = V;
+        VnoT(0, 3) = 0;
+        VnoT(1, 3) = 0;
+        VnoT(2, 3) = 0;
 
-		glBindTextureUnit(0, renderTex.GetTextureID());
-		glBindVertexArray(planeVAO);
-		glDrawArrays(GL_TRIANGLES, 0, 6);
+        skyboxShader.prog.Bind();
+        skyboxShader.prog.SetUniformMatrix4("uProj", P.cell);
+        skyboxShader.prog.SetUniformMatrix4("uView", VnoT.cell);
+        skyboxShader.prog.SetUniform("uEnv", 0);
+        glBindTextureUnit(0, cubemapTex);
+        glBindVertexArray(skyboxVAO);
+        glDrawArrays(GL_TRIANGLES, 0, 36);
+
+        glDepthMask(GL_TRUE);
+        glDepthFunc(GL_LESS);
+
+        // Object
+        shader.prog.Bind();
+        shader.prog.SetUniformMatrix4("uM", M.cell);
+        shader.prog.SetUniformMatrix4("uV", V.cell);
+        shader.prog.SetUniformMatrix4("uP", P.cell);
+        shader.prog.SetUniform("uCamPosW", camPosW.x, camPosW.y, camPosW.z);
+        shader.prog.SetUniform("uLightPosW", lightPosW.x, lightPosW.y, lightPosW.z);
+        shader.prog.SetUniform("uEnvMap", 2);
+        glBindTextureUnit(2, cubemapTex);
+        shader.prog.SetUniform("uReflectStrength", 1.0f);
+        shader.prog.SetUniform("uRefractStrength", 0.0f);
+        shader.prog.SetUniform("uVisMode", g_visMode);
+
+        // Texture units
+        shader.prog.SetUniform("uDiffuseTex", 0);
+        shader.prog.SetUniform("uSpecularTex", 1);
+        glBindVertexArray(vao);
+
+        // Support multiple materials
+        if (mesh.NM() > 0)
+        {
+            for (unsigned int mi = 0; mi < mesh.NM(); ++mi)
+            {
+                int firstFace = mesh.GetMaterialFirstFace((int)mi);
+                int faceCount = mesh.GetMaterialFaceCount((int)mi);
+                if (faceCount <= 0)
+                    continue;
+
+                const GPUMaterial& m = gpuMtls[mi];
+
+                // Set material properties
+                shader.prog.SetUniform("uKa", m.Ka.x, m.Ka.y, m.Ka.z);
+                shader.prog.SetUniform("uKd", m.Kd.x, m.Kd.y, m.Kd.z);
+                shader.prog.SetUniform("uKs", m.Ks.x, m.Ks.y, m.Ks.z);
+                shader.prog.SetUniform("uTf", m.Tf.x, m.Tf.y, m.Tf.z);
+                shader.prog.SetUniform("uNs", m.Ns);
+                shader.prog.SetUniform("uNi", m.Ni);
+                shader.prog.SetUniform("uIllum", m.illum);
+
+                // Binding Texture (unit0 = kd, unit1 = ks)
+                glBindTextureUnit(0, m.texKd);
+                glBindTextureUnit(1, m.texKs);
+                shader.prog.SetUniform("uHasDiffuseTex", m.hasKd);
+                shader.prog.SetUniform("uHasSpecularTex", m.hasKs);
+
+                glDrawArrays(GL_TRIANGLES, firstFace * 3, faceCount * 3);
+            }
+        }
+        else    // If no material
+        {
+            const GPUMaterial& m = gpuMtls[0];
+            shader.prog.SetUniform("uKa", m.Ka.x, m.Ka.y, m.Ka.z);
+            shader.prog.SetUniform("uKd", m.Kd.x, m.Kd.y, m.Kd.z);
+            shader.prog.SetUniform("uKs", m.Ks.x, m.Ks.y, m.Ks.z);
+            shader.prog.SetUniform("uTf", m.Tf.x, m.Tf.y, m.Tf.z);
+            shader.prog.SetUniform("uNs", m.Ns);
+            shader.prog.SetUniform("uNi", m.Ni);
+            shader.prog.SetUniform("uIllum", m.illum);
+
+            glBindTextureUnit(0, 0);
+            glBindTextureUnit(1, 0);
+            shader.prog.SetUniform("uHasDiffuseTex", false);
+            shader.prog.SetUniform("uHasSpecularTex", false);
+
+            glDrawArrays(GL_TRIANGLES, 0, (GLsizei)(mesh.NF() * 3));
+        }
+
+        // Pass 3: Draw Plane with reflection
+        // Plane
+        glEnable(GL_DEPTH_TEST);
+        glDisable(GL_BLEND);
+        glEnable(GL_POLYGON_OFFSET_FILL);
+        glPolygonOffset(1.0f, 1.0f);
+        glBindVertexArray(reflPlaneVAO);
+        glDrawArrays(GL_TRIANGLES, 0, 6);
+        glDisable(GL_POLYGON_OFFSET_FILL);
+
+        cy::Matrix4f Mplane;
+        Mplane.SetIdentity();
+        shader.prog.Bind();
+        shader.prog.SetUniformMatrix4("uM", Mplane.cell);
+        shader.prog.SetUniformMatrix4("uV", V.cell);
+        shader.prog.SetUniformMatrix4("uP", P.cell);
+        shader.prog.SetUniform("uCamPosW", camPosW.x, camPosW.y, camPosW.z);
+        shader.prog.SetUniform("uLightPosW", lightPosW.x, lightPosW.y, lightPosW.z);
+        shader.prog.SetUniform("uEnvMap", 2);
+        glBindTextureUnit(2, cubemapTex);
+
+        shader.prog.SetUniform("uReflectStrength", 1.0f);
+        shader.prog.SetUniform("uRefractStrength", 0.0f);
+        shader.prog.SetUniform("uHasDiffuseTex", false);
+        shader.prog.SetUniform("uHasSpecularTex", false);
+        shader.prog.SetUniform("uKa", 0.00f, 0.00f, 0.00f);
+        shader.prog.SetUniform("uKd", 0.04f, 0.04f, 0.04f);
+        shader.prog.SetUniform("uKs", 0.6f, 0.6f, 0.6f);
+        shader.prog.SetUniform("uNs", 512.0f);
+        shader.prog.SetUniform("uReflectStrength", 0.8f);
+
+        glBindVertexArray(reflPlaneVAO);
+        glDrawArrays(GL_TRIANGLES, 0, 6);
+
+        // Reflection
+        glEnable(GL_DEPTH_TEST);
+		glDepthFunc(GL_LEQUAL);
+        glDepthMask(GL_FALSE);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+
+        // Draw reflective plane
+        reflectShader.prog.Bind();
+        reflectShader.prog.SetUniformMatrix4("uM", Mplane.cell);
+        reflectShader.prog.SetUniformMatrix4("uV", V.cell);
+        reflectShader.prog.SetUniformMatrix4("uP", P.cell);
+        reflectShader.prog.SetUniformMatrix4("uVref", Vref.cell);
+        reflectShader.prog.SetUniformMatrix4("uPref", P.cell);
+
+        reflectShader.prog.SetUniform("uCamPosW", camPosW.x, camPosW.y, camPosW.z);
+        cy::Vec3f fadeCenterW(0.0f, 0.0f, 0.0f);
+        reflectShader.prog.SetUniform("uFadeCenterW", fadeCenterW.x, fadeCenterW.y, fadeCenterW.z);
+        reflectShader.prog.SetUniform("uFadeRadius", 2.0f);
+        reflectShader.prog.SetUniform("uReflectOpacity", 0.6f);
+        reflectShader.prog.SetUniform("uReflectionTex", 0);
+
+        glBindTextureUnit(0, renderTex.GetTextureID());
+        glBindVertexArray(reflPlaneVAO);
+        glDrawArrays(GL_TRIANGLES, 0, 6);
+
+        glDepthMask(GL_TRUE);
+		glDepthFunc(GL_LESS);
+        glDisable(GL_BLEND);
 
         glfwSwapBuffers(window);
         glfwPollEvents();
     }
 
-	// Clean up materials
+    // Clean up materials
     for (auto& m : gpuMtls)
     {
         if (m.texKd) glDeleteTextures(1, &m.texKd);
         if (m.texKs) glDeleteTextures(1, &m.texKs);
     }
-	glDeleteBuffers(1, &planeVBO);
+    glDeleteBuffers(1, &planeVBO);
     glDeleteVertexArrays(1, &planeVAO);
     glDeleteBuffers(1, &tbo);
     glDeleteBuffers(1, &nbo);

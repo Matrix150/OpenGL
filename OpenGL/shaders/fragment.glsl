@@ -1,11 +1,13 @@
 #version 460 core
 
 in vec2 vUV;
-in vec3 vPosV;
-in vec3 vNormalV;
+in vec3 vPosW;
+in vec3 vNormalW;
 
 uniform int uVisMode;
-uniform vec3 uLightPosV;
+// World space light & camera
+uniform vec3 uLightPosW;
+uniform vec3 uCamPosW;
 
 // Material properties from .mtl file
 uniform vec3 uKa;
@@ -21,13 +23,19 @@ uniform bool uHasDiffuseTex;
 uniform sampler2D uSpecularTex;
 uniform bool uHasSpecularTex;
 
+// Envrionment mapping
+uniform samplerCube uEnvMap;
+uniform float uReflectStrength;
+
 out vec4 FragColor;
 
 void main()
 {
-    vec3 N = normalize(vNormalV);
-    vec3 L = normalize(uLightPosV - vPosV);
-    vec3 V = normalize(-vPosV);                 // camera at origin in view space
+    vec3 N = normalize(vNormalW);
+    if (!gl_FrontFacing) 
+        N = -N;
+    vec3 L = normalize(uLightPosW - vPosW);
+    vec3 V = normalize(uCamPosW - vPosW);                 // camera at origin in view space
     vec3 H = normalize(L + V);
 
     float NdotL = max(dot(N, L), 0.0);
@@ -51,7 +59,17 @@ void main()
     {
         specular = Ks * pow(NdotH, shininess);
     }
+    vec3 blinn = ambient + diffuse + specular;
 
+    // Reflection (world position)
+    vec3 R = reflect(-V, N);
+    vec3 envColor = texture(uEnvMap, R).rgb;
+
+    // Fresnel
+    float fresnel = pow(1.0 - max(dot(N, V), 0.0), 5.0);
+    float reflW = mix(uReflectStrength, 1.0, fresnel) * uReflectStrength;
+
+    // Viewing mode
     vec3 color;
     if (uVisMode == 1) 
         color = ambient;
@@ -62,7 +80,7 @@ void main()
     else if (uVisMode == 4) 
         color = N * 0.5 + 0.5;
     else 
-        color = ambient + diffuse + specular;
+        color = mix(blinn, envColor, clamp(reflW, 0.0, 1.0));
 
     FragColor = vec4(color, 1.0);
 }
