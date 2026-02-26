@@ -1253,6 +1253,9 @@ int main(int argc, char** argv)
         glDepthMask(GL_FALSE);
         glEnable(GL_BLEND);
         glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+        glEnable(GL_CULL_FACE);
+        glCullFace(GL_BACK);
+        glFrontFace(GL_CW);
 
         // Draw reflective plane
         reflectShader.prog.Bind();
@@ -1263,8 +1266,8 @@ int main(int argc, char** argv)
         reflectShader.prog.SetUniformMatrix4("uPref", P.cell);
 
         reflectShader.prog.SetUniform("uCamPosW", camPosW.x, camPosW.y, camPosW.z);
-        cy::Vec3f fadeCenterW(0.0f, 0.0f, 0.0f);
-        reflectShader.prog.SetUniform("uFadeCenterW", fadeCenterW.x, fadeCenterW.y, fadeCenterW.z);
+        //cy::Vec3f fadeCenterW(0.0f, 0.0f, 0.0f);
+        //reflectShader.prog.SetUniform("uFadeCenterW", fadeCenterW.x, fadeCenterW.y, fadeCenterW.z);
         reflectShader.prog.SetUniform("uFadeRadius", 2.0f);
         reflectShader.prog.SetUniform("uReflectOpacity", 0.6f);
         reflectShader.prog.SetUniform("uReflectionTex", 0);
@@ -1276,6 +1279,7 @@ int main(int argc, char** argv)
         glDepthMask(GL_TRUE);
 		glDepthFunc(GL_LESS);
         glDisable(GL_BLEND);
+        glDisable(GL_CULL_FACE);
 
         glfwSwapBuffers(window);
         glfwPollEvents();
