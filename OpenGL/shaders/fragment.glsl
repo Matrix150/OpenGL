@@ -3,11 +3,20 @@
 in vec2 vUV;
 in vec3 vPosW;
 in vec3 vNormalW;
+in vec4 vPosLightClip;
 
 uniform int uVisMode;
 // World space light & camera
 uniform vec3 uLightPosW;
 uniform vec3 uCamPosW;
+
+// Spotlight
+uniform vec3 uLightDirW;
+uniform float uSpotCosInner;
+uniform float uSpotCosOuter;
+
+// Shadow Map
+uniform sampler2DShadow uShadowMap;
 
 // Material properties from .mtl file
 uniform vec3 uKa;
@@ -28,6 +37,44 @@ uniform samplerCube uEnvMap;
 uniform float uReflectStrength;
 
 out vec4 FragColor;
+
+float ComputeSpotFactor(vec3 L) // L = normalize(lightPos - pos) (from fragment to light)
+{
+    // From light to fragment:
+    vec3 lightToFrag = normalize(-L);
+    float cosTheta = dot(normalize(uLightDirW), lightToFrag);
+    return smoothstep(uSpotCosOuter, uSpotCosInner, cosTheta);
+}
+
+float ComputeShadow(vec3 N, vec3 L)
+{
+    // Project into shadow map UVZ
+    vec3 proj = vPosLightClip.xyz / vPosLightClip.w;
+    proj = proj * 0.5 + 0.5;
+
+    // Outside light frustum => no shadowing
+    if (proj.x < 0.0 || proj.x > 1.0 || proj.y < 0.0 || proj.y > 1.0 || proj.z < 0.0 || proj.z > 1.0)
+        return 1.0;
+
+    // Slope-scale depth bias (helps reduce acne)
+    float ndotl = max(dot(N, L), 0.0);
+    float bias = max(0.0015 * (1.0 - ndotl), 0.0005);
+
+    // 3x3 PCF
+    ivec2 sz = textureSize(uShadowMap, 0);
+    vec2 texel = 1.0 / vec2(sz);
+
+    float sum = 0.0;
+    for (int y = -1; y <= 1; ++y)
+    {
+        for (int x = -1; x <= 1; ++x)
+        {
+            vec2 uv = proj.xy + vec2(x, y) * texel;
+            sum += texture(uShadowMap, vec3(uv, proj.z - bias));
+        }
+    }
+    return sum / 9.0;
+}
 
 void main()
 {
@@ -59,7 +106,11 @@ void main()
     {
         specular = Ks * pow(NdotH, shininess);
     }
-    vec3 blinn = ambient + diffuse + specular;
+
+    float spot = ComputeSpotFactor(L);
+    float shadow = ComputeShadow(N, L);
+
+    vec3 blinn = ambient + (diffuse + specular) * spot * shadow;
 
     // Reflection (world position)
     vec3 R = reflect(-V, N);
@@ -74,9 +125,9 @@ void main()
     if (uVisMode == 1) 
         color = ambient;
     else if (uVisMode == 2) 
-        color = diffuse;
+        color = diffuse * spot * shadow;
     else if (uVisMode == 3) 
-        color = specular;
+        color = specular * spot * shadow;
     else if (uVisMode == 4) 
         color = N * 0.5 + 0.5;
     else 

@@ -209,6 +209,26 @@ struct ReflectShader
         }
     )GLSL";
 };
+
+struct ShadowDepthShader
+{
+    cy::GLSLProgram prog;
+    bool built = false;
+    const char* vs = R"GLSL(
+        #version 460 core
+        layout(location=0) in vec3 aPos;
+        uniform mat4 uLightMVP;
+        void main()
+        {
+            gl_Position = uLightMVP * vec4(aPos, 1.0);
+        }
+    )GLSL";
+
+    const char* fs = R"GLSL(
+        #version 460 core
+        void main() { }
+    )GLSL";
+};
 // ------------------------------
 
 // Helping tools
@@ -251,6 +271,27 @@ static cy::Matrix4f MakeView(float yaw, float pitch, float dist)
     cy::Matrix4f R_pitch = cy::Matrix4f::RotationX(pitch);
     cy::Matrix4f Tcam = cy::Matrix4f::Translation(cy::Vec3f(0.0f, 0.0f, -dist));
     return Tcam * R_pitch * R_yaw;
+}
+
+static cy::Matrix4f MakeLookAt(const cy::Vec3f& eye, const cy::Vec3f& target, const cy::Vec3f& up)
+{
+    cy::Vec3f f = (target - eye);
+    f.Normalize();
+    cy::Vec3f s = f.Cross(up);
+    s.Normalize();
+    cy::Vec3f u = s.Cross(f);
+    cy::Matrix4f M;
+    M.SetIdentity();
+
+    M(0, 0) = s.x;  M(1, 0) = s.y;  M(2, 0) = s.z;  M(3, 0) = 0.0f;
+    M(0, 1) = u.x;  M(1, 1) = u.y;  M(2, 1) = u.z;  M(3, 1) = 0.0f;
+    M(0, 2) = -f.x; M(1, 2) = -f.y; M(2, 2) = -f.z; M(3, 2) = 0.0f;
+
+    M(0, 3) = -s.Dot(eye);
+    M(1, 3) = -u.Dot(eye);
+    M(2, 3) = f.Dot(eye);
+    M(3, 3) = 1.0f;
+    return M;
 }
 
 // Object MVP & MV
@@ -369,6 +410,18 @@ static bool BuildReflectShader(ReflectShader& shader)
     }
     shader.built = true;
     std::cout << "Reflection shader build OK.\n";
+    return true;
+}
+
+static bool BuildShadowDepthShader(ShadowDepthShader& shader)
+{
+    if (!shader.prog.Build<false, false>(shader.vs, shader.fs))
+    {
+        std::cerr << "Shadow depth shader build failed.\n";
+        return false;
+    }
+    shader.built = true;
+    std::cout << "Shadow depth shader build OK.\n";
     return true;
 }
 
@@ -794,6 +847,38 @@ int main(int argc, char** argv)
         return -1;
     }
 
+    ShadowDepthShader shadowDepthShader;
+    if (!BuildShadowDepthShader(shadowDepthShader))
+    {
+        std::cerr << "ERROR: shadow depth shader build failed\n";
+        glfwDestroyWindow(window);
+        glfwTerminate();
+        return -1;
+    }
+
+    // Shadow map
+    cy::GLRenderDepth<GL_TEXTURE_2D> shadowDepth;
+    const int SHADOW_SIZE = 2048;
+    if (!shadowDepth.Initialize(true, (GLsizei)SHADOW_SIZE, (GLsizei)SHADOW_SIZE, GL_DEPTH_COMPONENT24))
+    {
+        std::cerr << "ERROR: shadow depth buffer initialization failed\n";
+        glfwDestroyWindow(window);
+        glfwTerminate();
+        return -1;
+    }
+    // Make Sampling
+    {
+        GLuint shadowTex = shadowDepth.GetTextureID();
+        glTextureParameteri(shadowTex, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTextureParameteri(shadowTex, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTextureParameteri(shadowTex, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_BORDER);
+        glTextureParameteri(shadowTex, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_BORDER);
+        float border[4] = { 1,1,1,1 };
+        glTextureParameterfv(shadowTex, GL_TEXTURE_BORDER_COLOR, border);
+        glTextureParameteri(shadowTex, GL_TEXTURE_COMPARE_MODE, GL_COMPARE_REF_TO_TEXTURE);
+        glTextureParameteri(shadowTex, GL_TEXTURE_COMPARE_FUNC, GL_LEQUAL);
+    }
+
     // Cubemap Setup
     std::array<std::string, 6> cubemapFaces = {
         "assets/cubemap/cubemap_posx.png",
@@ -1043,6 +1128,51 @@ int main(int argc, char** argv)
         MirrorY.SetIdentity();
         MirrorY(1, 1) = -1.0f;     // Mirror across XZ plane (Y=0)
 
+        // Pass0: Shadow Map
+        const cy::Vec3f lightTargetW(0.0f, 0.0f, 0.0f);
+        cy::Vec3f lightDirW = lightTargetW - lightPosW;
+        lightDirW.Normalize();
+
+        cy::Matrix4f Vlight = MakeLookAt(lightPosW, lightTargetW, cy::Vec3f(0.0f, 1.0f, 0.0f));
+        cy::Matrix4f Plight = cy::Matrix4f::Perspective(DegToRad(40.0f), 1.0f, 0.1f, 20.0f);
+        cy::Matrix4f LightVP = Plight * Vlight;
+        cy::Matrix4f LightMVP = LightVP * M;
+
+        shadowDepth.Bind();
+        glEnable(GL_DEPTH_TEST);
+        glClear(GL_DEPTH_BUFFER_BIT);
+        glEnable(GL_CULL_FACE);
+        glCullFace(GL_FRONT);
+
+        shadowDepthShader.prog.Bind();
+        shadowDepthShader.prog.SetUniformMatrix4("uLightMVP", LightMVP.cell);
+
+        glBindVertexArray(vao);
+
+        // Draw Only the Object into the Shadow Map
+        if (mesh.NM() > 0)
+        {
+            for (unsigned int mi = 0; mi < mesh.NM(); ++mi)
+            {
+                int firstFace = mesh.GetMaterialFirstFace((int)mi);
+                int faceCount = mesh.GetMaterialFaceCount((int)mi);
+                if (faceCount <= 0)
+                    continue;
+                glDrawArrays(GL_TRIANGLES, firstFace * 3, faceCount * 3);
+            }
+        }
+        else
+        {
+            glDrawArrays(GL_TRIANGLES, 0, (GLsizei)(mesh.NF() * 3));
+        }
+
+        shadowDepth.Unbind();
+        glCullFace(GL_BACK);
+        glDisable(GL_CULL_FACE);
+
+        const float spotCosInner = cosf(DegToRad(15.0f));
+        const float spotCosOuter = cosf(DegToRad(22.0f));
+
         // Pass 1: render teapot (mirrored) -> render texture
         renderTex.Bind();
         //glBindFramebuffer(GL_FRAMEBUFFER, 0);
@@ -1061,6 +1191,15 @@ int main(int argc, char** argv)
         shader.prog.SetUniformMatrix4("uP", P.cell);
         shader.prog.SetUniform("uCamPosW", camPosW.x, camPosW.y, camPosW.z);
         shader.prog.SetUniform("uLightPosW", lightPosW.x, lightPosW.y, lightPosW.z);
+
+        // Shadow / spotlight uniforms
+        shader.prog.SetUniformMatrix4("uLightVP", LightVP.cell);
+        shader.prog.SetUniform("uLightDirW", lightDirW.x, lightDirW.y, lightDirW.z);
+        shader.prog.SetUniform("uSpotCosInner", spotCosInner);
+        shader.prog.SetUniform("uSpotCosOuter", spotCosOuter);
+        shader.prog.SetUniform("uShadowMap", 3);
+        glBindTextureUnit(3, shadowDepth.GetTextureID());
+
         shader.prog.SetUniform("uEnvMap", 2);
         glBindTextureUnit(2, cubemapTex);
 
@@ -1153,6 +1292,15 @@ int main(int argc, char** argv)
         shader.prog.SetUniformMatrix4("uP", P.cell);
         shader.prog.SetUniform("uCamPosW", camPosW.x, camPosW.y, camPosW.z);
         shader.prog.SetUniform("uLightPosW", lightPosW.x, lightPosW.y, lightPosW.z);
+
+        // Shadow / spotlight uniforms
+        shader.prog.SetUniformMatrix4("uLightVP", LightVP.cell);
+        shader.prog.SetUniform("uLightDirW", lightDirW.x, lightDirW.y, lightDirW.z);
+        shader.prog.SetUniform("uSpotCosInner", spotCosInner);
+        shader.prog.SetUniform("uSpotCosOuter", spotCosOuter);
+        shader.prog.SetUniform("uShadowMap", 3);
+        glBindTextureUnit(3, shadowDepth.GetTextureID());
+
         shader.prog.SetUniform("uEnvMap", 2);
         glBindTextureUnit(2, cubemapTex);
         shader.prog.SetUniform("uReflectStrength", 1.0f);
@@ -1231,6 +1379,15 @@ int main(int argc, char** argv)
         shader.prog.SetUniformMatrix4("uP", P.cell);
         shader.prog.SetUniform("uCamPosW", camPosW.x, camPosW.y, camPosW.z);
         shader.prog.SetUniform("uLightPosW", lightPosW.x, lightPosW.y, lightPosW.z);
+
+        // Shadow / spotlight uniforms
+        shader.prog.SetUniformMatrix4("uLightVP", LightVP.cell);
+        shader.prog.SetUniform("uLightDirW", lightDirW.x, lightDirW.y, lightDirW.z);
+        shader.prog.SetUniform("uSpotCosInner", spotCosInner);
+        shader.prog.SetUniform("uSpotCosOuter", spotCosOuter);
+        shader.prog.SetUniform("uShadowMap", 3);
+        glBindTextureUnit(3, shadowDepth.GetTextureID());
+
         shader.prog.SetUniform("uEnvMap", 2);
         glBindTextureUnit(2, cubemapTex);
 

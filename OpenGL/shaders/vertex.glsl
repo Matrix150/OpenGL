@@ -8,9 +8,12 @@ uniform mat4 uM;
 uniform mat4 uV;
 uniform mat4 uP;
 
+uniform mat4 uLightVP;
+
 out vec2 vUV;
 out vec3 vPosW;
 out vec3 vNormalW;
+out vec4 vPosLightClip;
 
 void main()
 {
@@ -20,6 +23,8 @@ void main()
     vNormalW = normalMat * aNormal;
     vUV = vec2(aUV.x, 1.0 - aUV.y);     // Flip V coordinate for OpenGL
     //vUV = aUV;
+
+    vPosLightClip = uLightVP * posW;    // For Shadow Mapping
 
     gl_Position = uP * uV * posW;
 }
