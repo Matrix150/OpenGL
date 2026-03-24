@@ -716,7 +716,7 @@ static void key_callback(GLFWwindow* window, int key, int /*scancode*/, int acti
 // ------------------------------
 
 
-int main(int argc, char** argv)
+/*int main(int argc, char** argv)
 {
     // Load obj file from assets folder
     if (argc < 2)
@@ -1146,18 +1146,18 @@ int main(int argc, char** argv)
 
     while (!glfwWindowShouldClose(window))
     {
-        /*// Automatically animate the background color
-        const float t = static_cast<float>(glfwGetTime());      // Get seconds
-        const float r = 0.5f + 0.5f * std::sin(t * 1.0f);
-        const float g = 0.5f + 0.5f * std::sin(t * 1.3f + 2.0f);
-        const float b = 0.5f + 0.5f * std::sin(t * 1.7f + 4.0f);
+        // Automatically animate the background color
+        //const float t = static_cast<float>(glfwGetTime());      // Get seconds
+        //const float r = 0.5f + 0.5f * std::sin(t * 1.0f);
+        //const float g = 0.5f + 0.5f * std::sin(t * 1.3f + 2.0f);
+        //const float b = 0.5f + 0.5f * std::sin(t * 1.7f + 4.0f);
 
         //glClearColor(1.0f, 0.0f, 0.0f, 1.0f);       // Set background color to red(1, 0, 0)
-        glClearColor(r, g, b, 1.0f);
-        glClear(GL_COLOR_BUFFER_BIT);
+        //glClearColor(r, g, b, 1.0f);
+        //glClear(GL_COLOR_BUFFER_BIT);
 
-        glfwSwapBuffers(window);
-        glfwPollEvents();*/
+        //glfwSwapBuffers(window);
+        //glfwPollEvents();
 
         if (shader.reloadShaders)
         {
@@ -1553,4 +1553,4 @@ int main(int argc, char** argv)
     glfwDestroyWindow(window);
     glfwTerminate();
     return 0;
-}
+}*/
