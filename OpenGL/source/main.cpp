@@ -229,6 +229,33 @@ struct ShadowDepthShader
         void main() { }
     )GLSL";
 };
+
+struct LightMarkerShader
+{
+    cy::GLSLProgram prog;
+    bool built = false;
+    const char* vs = R"GLSL(
+        #version 460 core
+        layout(location=0) in vec3 aPos;
+        uniform mat4 uM;
+        uniform mat4 uV;
+        uniform mat4 uP;
+        void main()
+        {
+            gl_Position = uP * uV * uM * vec4(aPos, 1.0);
+        }
+    )GLSL";
+
+    const char* fs = R"GLSL(
+        #version 460 core
+        uniform vec3 uColor;
+        out vec4 FragColor;
+        void main()
+        {
+            FragColor = vec4(uColor, 1.0);
+        }
+    )GLSL";
+};
 // ------------------------------
 
 // Helping tools
@@ -422,6 +449,18 @@ static bool BuildShadowDepthShader(ShadowDepthShader& shader)
     }
     shader.built = true;
     std::cout << "Shadow depth shader build OK.\n";
+    return true;
+}
+
+static bool BuildLightMarkerShader(LightMarkerShader& shader)
+{
+    if (!shader.prog.Build<false, false>(shader.vs, shader.fs))
+    {
+        std::cerr << "Light marker shader build failed.\n";
+        return false;
+    }
+    shader.built = true;
+    std::cout << "Light marker shader build OK.\n";
     return true;
 }
 
@@ -856,6 +895,15 @@ int main(int argc, char** argv)
         return -1;
     }
 
+    LightMarkerShader lightMarkerShader;
+    if (!BuildLightMarkerShader(lightMarkerShader))
+    {
+        std::cerr << "ERROR: light marker shader build failed\n";
+        glfwDestroyWindow(window);
+        glfwTerminate();
+        return -1;
+    }
+
     // Shadow map
     cy::GLRenderDepth<GL_TEXTURE_2D> shadowDepth;
     const int SHADOW_SIZE = 2048;
@@ -980,6 +1028,39 @@ int main(int argc, char** argv)
     glEnableVertexArrayAttrib(reflPlaneVAO, 2);
     glVertexArrayAttribFormat(reflPlaneVAO, 2, 2, GL_FLOAT, GL_FALSE, 6 * sizeof(float));
     glVertexArrayAttribBinding(reflPlaneVAO, 2, 0);
+
+    // Light Marker Setup
+    GLuint lightMarkerVAO = 0, lightMarkerVBO = 0;
+    glCreateVertexArrays(1, &lightMarkerVAO);
+    glCreateBuffers(1, &lightMarkerVBO);
+
+    const float s = 0.06f;
+    const float lightMarkerVerts[] = {
+        // back
+        -s,-s,-s,   s,-s,-s,   s, s,-s,
+        -s,-s,-s,   s, s,-s,  -s, s,-s,
+        // front
+        -s,-s, s,   s,-s, s,   s, s, s,
+        -s,-s, s,   s, s, s,  -s, s, s,
+        // left
+        -s,-s,-s,  -s, s,-s,  -s, s, s,
+        -s,-s,-s,  -s, s, s,  -s,-s, s,
+        // right
+         s,-s,-s,   s, s,-s,   s, s, s,
+         s,-s,-s,   s, s, s,   s,-s, s,
+         // bottom
+         -s,-s,-s,  -s,-s, s,   s,-s, s,
+         -s,-s,-s,   s,-s, s,   s,-s,-s,
+         // top
+         -s, s,-s,  -s, s, s,   s, s, s,
+         -s, s,-s,   s, s, s,   s, s,-s
+    };
+
+    glNamedBufferData(lightMarkerVBO, sizeof(lightMarkerVerts), lightMarkerVerts, GL_STATIC_DRAW);
+    glVertexArrayVertexBuffer(lightMarkerVAO, 0, lightMarkerVBO, 0, 3 * sizeof(float));
+    glEnableVertexArrayAttrib(lightMarkerVAO, 0);
+    glVertexArrayAttribFormat(lightMarkerVAO, 0, 3, GL_FLOAT, GL_FALSE, 0);
+    glVertexArrayAttribBinding(lightMarkerVAO, 0, 0);
 
     // Build GPU Materials
     std::vector<GPUMaterial> gpuMtls;
@@ -1361,14 +1442,28 @@ int main(int argc, char** argv)
             glDrawArrays(GL_TRIANGLES, 0, (GLsizei)(mesh.NF() * 3));
         }
 
+        // Light Marker
+        glDisable(GL_CULL_FACE);
+        glEnable(GL_DEPTH_TEST);
+        glDisable(GL_BLEND);
+
+        cy::Matrix4f MLight = cy::Matrix4f::Translation(lightPosW);
+
+        lightMarkerShader.prog.Bind();
+        lightMarkerShader.prog.SetUniformMatrix4("uM", MLight.cell);
+        lightMarkerShader.prog.SetUniformMatrix4("uV", V.cell);
+        lightMarkerShader.prog.SetUniformMatrix4("uP", P.cell);
+        lightMarkerShader.prog.SetUniform("uColor", 1.0f, 0.9f, 0.2f);
+
+        glBindVertexArray(lightMarkerVAO);
+        glDrawArrays(GL_TRIANGLES, 0, 36);
+    
         // Pass 3: Draw Plane with reflection
         // Plane
         glEnable(GL_DEPTH_TEST);
         glDisable(GL_BLEND);
         glEnable(GL_POLYGON_OFFSET_FILL);
         glPolygonOffset(1.0f, 1.0f);
-        glBindVertexArray(reflPlaneVAO);
-        glDrawArrays(GL_TRIANGLES, 0, 6);
         glDisable(GL_POLYGON_OFFSET_FILL);
 
         cy::Matrix4f Mplane;
