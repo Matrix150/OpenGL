@@ -29,6 +29,8 @@ static float g_objScale = 1.0f;
 static bool g_usePerspective = true;
 static float g_orthoScale = 1.5f;
 
+static bool g_showDebugViews = false;
+
 // Depth
 static bool g_showDepth = false;
 // FXAA
@@ -477,6 +479,90 @@ struct FXAAShader
     )GLSL";
 };
 
+struct MotionVectorShader
+{
+    cy::GLSLProgram prog;
+    bool built = false;
+    const char* vs = kFullscreenVS;
+
+    const char* fs = R"GLSL(
+        #version 460 core
+        in vec2 vUV;
+        out vec4 FragColor;
+
+        uniform sampler2D uSceneDepth;
+        uniform mat4 uCurrInvVP;
+        uniform mat4 uPrevVP;
+
+        vec3 ReconstructWorldPos(vec2 uv, float depth)
+        {
+            vec4 ndc = vec4(uv * 2.0 - 1.0, depth * 2.0 - 1.0, 1.0);
+            vec4 world = uCurrInvVP * ndc;
+            return world.xyz / world.w;
+        }
+
+        vec2 ComputeMotionVector(vec2 uv, float depth)
+        {
+            vec3 worldPos = ReconstructWorldPos(uv, depth);
+            vec4 prevClip = uPrevVP * vec4(worldPos, 1.0);
+            vec2 prevNDC = prevClip.xy / prevClip.w;
+            vec2 prevUV = prevNDC * 0.5 + 0.5;
+            return uv - prevUV;
+        }
+
+        void main()
+        {
+            float depth = texture(uSceneDepth, vUV).r;
+            if (depth >= 0.999999)
+            {
+                FragColor = vec4(0.0, 0.0, 0.0, 1.0);
+                return;
+            }
+
+            vec2 velocity = ComputeMotionVector(vUV, depth) * 5.0;
+            vec2 vis = clamp(velocity * 0.5 + 0.5, 0.0, 1.0);
+            FragColor = vec4(vis, 0.0, 1.0);
+        }
+    )GLSL";
+};
+
+struct DebugDisplayShader
+{
+    cy::GLSLProgram prog;
+    bool built = false;
+    const char* vs = kFullscreenVS;
+
+    const char* fs = R"GLSL(
+        #version 460 core
+        in vec2 vUV;
+        out vec4 FragColor;
+
+        uniform sampler2D uInputTex;
+        uniform int uApplyToneMap;
+
+        vec3 ToneMapACES(vec3 x)
+        {
+            const float a = 2.51;
+            const float b = 0.03;
+            const float c = 2.43;
+            const float d = 0.59;
+            const float e = 0.14;
+            return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
+        }
+
+        void main()
+        {
+            vec3 color = texture(uInputTex, vUV).rgb;
+            if (uApplyToneMap == 1)
+            {
+                color = ToneMapACES(color);
+                color = pow(max(color, vec3(0.0)), vec3(1.0 / 2.2));
+            }
+            FragColor = vec4(color, 1.0);
+        }
+    )GLSL";
+};
+
 struct DepthPreviewShader
 {
     cy::GLSLProgram prog;
@@ -777,6 +863,11 @@ static void key_callback(GLFWwindow* window, int key, int /*scancode*/, int acti
         g_enableBloom = !g_enableBloom;
         std::cout << "[B] Bloom = " << (g_enableBloom ? "ON" : "OFF") << std::endl;
     }    
+    if (key == GLFW_KEY_V && action == GLFW_PRESS)
+    {
+        g_showDebugViews = !g_showDebugViews;
+        std::cout << "[V] Debug Views = " << (g_showDebugViews ? "ON" : "OFF") << std::endl;
+    }
     if (key == GLFW_KEY_T && action == GLFW_PRESS)
     {
         g_enableToneMapping = !g_enableToneMapping;
@@ -917,13 +1008,13 @@ int main(int argc, char** argv)
     std::cout << "GL_VERSION: " << glGetString(GL_VERSION) << "\n";
     std::cout << "GLSL: " << glGetString(GL_SHADING_LANGUAGE_VERSION) << "\n";
     std::cout << "Controls:\n";
-    std::cout << "Controls:\n";
     std::cout << "  LMB drag        : rotate camera\n";
     std::cout << "  RMB drag        : zoom camera\n";
     std::cout << "  Ctrl + LMB drag : rotate light\n";
     std::cout << "  W/A/S/D         : move camera (XZ)\n";
     std::cout << "  Q/E             : move camera (Y)\n";
     std::cout << "  Z               : toggle depth preview\n";
+    std::cout << "  V               : toggle debug split views\n";
     std::cout << "  F               : toggle FXAA\n";
     std::cout << "  M               : toggle motion blur\n";
     std::cout << "  B               : toggle bloom\n";
@@ -932,6 +1023,7 @@ int main(int argc, char** argv)
     std::cout << "  [ / ]           : exposure - / +\n";
     std::cout << "  G               : toggle color grading\n";
     std::cout << "  P               : perspective / orthographic\n";
+    std::cout << "Debug view layout: top-right Scene, mid-right Bloom Bright, bottom-left Bloom Blur, bottom-right Motion Vector\n";
 
     // Sahder
     LitShader litShader;
@@ -942,6 +1034,8 @@ int main(int argc, char** argv)
     ToneMapShader toneMapShader;
     ColorGradingShader gradingShader;
     FXAAShader fxaaShader;
+    MotionVectorShader motionVectorShader;
+    DebugDisplayShader debugDisplayShader;
     DepthPreviewShader depthShader;
 
     if (!BuildShader(litShader, "Failed to build lit shader.") ||
@@ -952,6 +1046,8 @@ int main(int argc, char** argv)
         !BuildShader(toneMapShader, "Failed to build tone mapping shader.") ||
         !BuildShader(gradingShader, "Failed to build color grading shader.") ||
         !BuildShader(fxaaShader, "Failed to build FXAA shader.") ||
+        !BuildShader(motionVectorShader, "Failed to build motion vector shader.") ||
+        !BuildShader(debugDisplayShader, "Failed to build debug display shader.") ||
         !BuildShader(depthShader, "Failed to build depth preview shader."))
     {
         glfwDestroyWindow(window);
@@ -1018,6 +1114,7 @@ int main(int argc, char** argv)
     ColorRenderTarget combineRT;
     ColorRenderTarget toneMapRT;
     ColorRenderTarget gradeRT;
+    ColorRenderTarget motionVectorRT;
 
     if (!CreateSceneRenderTarget(sceneRT, fbW, fbH) ||
         !CreateColorRenderTarget(motionRT, fbW, fbH) ||
@@ -1026,7 +1123,8 @@ int main(int argc, char** argv)
         !CreateColorRenderTarget(bloomBlurRT2, fbW, fbH) ||
         !CreateColorRenderTarget(combineRT, fbW, fbH) ||
         !CreateColorRenderTarget(toneMapRT, fbW, fbH) ||
-        !CreateColorRenderTarget(gradeRT, fbW, fbH))
+        !CreateColorRenderTarget(gradeRT, fbW, fbH) ||
+        !CreateColorRenderTarget(motionVectorRT, fbW, fbH))
     {
         glfwDestroyWindow(window);
         glfwTerminate();
@@ -1047,7 +1145,8 @@ int main(int argc, char** argv)
                 !CreateColorRenderTarget(bloomBlurRT2, fbW, fbH) ||
                 !CreateColorRenderTarget(combineRT, fbW, fbH) ||
                 !CreateColorRenderTarget(toneMapRT, fbW, fbH) ||
-                !CreateColorRenderTarget(gradeRT, fbW, fbH))
+                !CreateColorRenderTarget(gradeRT, fbW, fbH) ||
+                !CreateColorRenderTarget(motionVectorRT, fbW, fbH))
             {
                 std::cerr << "ERROR: failed to resize render targets\n";
                 break;
@@ -1133,6 +1232,20 @@ int main(int argc, char** argv)
             motionShader.prog.SetUniformMatrix4("uPrevVP", g_prevVP.cell);
             glBindTextureUnit(0, sceneRT.colorTex);
             glBindTextureUnit(1, sceneRT.depthTex);
+            DrawFullscreenQuad(fsQuadVAO);
+
+			// Pass2.5: Motion Vector to Motion Vector Render Target (for debug display)
+            glBindFramebuffer(GL_FRAMEBUFFER, motionVectorRT.fbo);
+            glViewport(0, 0, fbW, fbH);
+            glDisable(GL_DEPTH_TEST);
+            glClearColor(0.f, 0.f, 0.f, 1.f);
+            glClear(GL_COLOR_BUFFER_BIT);
+
+            motionVectorShader.prog.Bind();
+            motionVectorShader.prog.SetUniform("uSceneDepth", 0);
+            motionVectorShader.prog.SetUniformMatrix4("uCurrInvVP", currentInvVP.cell);
+            motionVectorShader.prog.SetUniformMatrix4("uPrevVP", g_prevVP.cell);
+            glBindTextureUnit(0, sceneRT.depthTex);
             DrawFullscreenQuad(fsQuadVAO);
 
 			// Pass3: Bright Extract to Bloom Brightness Render Target
@@ -1238,6 +1351,46 @@ int main(int argc, char** argv)
             fxaaShader.prog.SetUniform("uInvScreenSize", 1.0f / (float)fbW, 1.0f / (float)fbH);
             glBindTextureUnit(0, gradeRT.colorTex);
             DrawFullscreenQuad(fsQuadVAO);
+
+            if (g_showDebugViews)
+            {
+                const int pad = 12;
+				const int debugW = fbW / 4;
+				const int debugH = fbH / 4;
+
+                debugDisplayShader.prog.Bind();
+
+                // Top-right: Scene
+                glViewport(fbW - debugW - pad, fbH - debugH - pad, debugW, debugH);
+                debugDisplayShader.prog.SetUniform("uInputTex", 0);
+                debugDisplayShader.prog.SetUniform("uApplyToneMap", 1);
+                glBindTextureUnit(0, sceneRT.colorTex);
+                DrawFullscreenQuad(fsQuadVAO);
+
+                // Mid-right: Bloom Bright
+                glViewport(fbW - debugW - pad, fbH - 2 * debugH - 2 * pad, debugW, debugH);
+                debugDisplayShader.prog.SetUniform("uInputTex", 0);
+                debugDisplayShader.prog.SetUniform("uApplyToneMap", 1);
+                glBindTextureUnit(0, bloomBrightRT.colorTex);
+                DrawFullscreenQuad(fsQuadVAO);
+
+                // Bottom-left: Bloom Blur
+                glViewport(pad, pad, debugW, debugH);
+                debugDisplayShader.prog.SetUniform("uInputTex", 0);
+                debugDisplayShader.prog.SetUniform("uApplyToneMap", 1);
+                glBindTextureUnit(0, bloomBlurRT2.colorTex);
+                DrawFullscreenQuad(fsQuadVAO);
+
+                // Bottom-right: Motion Vector
+                glViewport(fbW - debugW - pad, pad, debugW, debugH);
+                debugDisplayShader.prog.SetUniform("uInputTex", 0);
+                debugDisplayShader.prog.SetUniform("uApplyToneMap", 0);
+                glBindTextureUnit(0, motionVectorRT.colorTex);
+                DrawFullscreenQuad(fsQuadVAO);
+
+                // Restore viewport for next frame safety
+                glViewport(0, 0, fbW, fbH);
+            }
         }
 
 		// Set Current VP as Previous VP for next frame
@@ -1249,6 +1402,7 @@ int main(int argc, char** argv)
     }
 
 	// Destroy Render Targets
+    DestroyColorRenderTarget(motionVectorRT);
     DestroyColorRenderTarget(gradeRT);
     DestroyColorRenderTarget(toneMapRT);
     DestroyColorRenderTarget(combineRT);
