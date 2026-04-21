@@ -8,6 +8,7 @@
 #include "cyGL.h"
 #include "cyTriMesh.h"
 #include "cyMatrix.h"
+#include "lodepng.h"
 
 // Properties
 // Mouse status
@@ -73,6 +74,93 @@ static const char* kFullscreenVS = R"GLSL(
 // ------------------------------
 
 
+// Material
+struct Material
+{
+    std::string name = "default";
+
+    cy::Vec3f Ka = cy::Vec3f(1.0f, 1.0f, 1.0f);
+    cy::Vec3f Kd = cy::Vec3f(1.0f, 1.0f, 1.0f);
+    cy::Vec3f Ks = cy::Vec3f(0.5f, 0.5f, 0.5f);
+    cy::Vec3f Ke = cy::Vec3f(0.0f, 0.0f, 0.0f);
+
+    float Ns = 32.0f;
+    float d = 1.0f;
+    float Ni = 1.0f;
+    int illum = 2;
+
+    std::string mapKa;
+    std::string mapKd;
+    std::string mapKs;
+};
+
+static std::string GetDirectoryFromPath(const std::string& path)
+{
+    size_t pos = path.find_last_of("/\\");
+    if (pos == std::string::npos) return ".";
+    return path.substr(0, pos);
+}
+
+static std::string ReplaceExtension(const std::string& path, const std::string& newExt)
+{
+    size_t slashPos = path.find_last_of("/\\");
+    size_t dotPos = path.find_last_of('.');
+    if (dotPos == std::string::npos || (slashPos != std::string::npos && dotPos < slashPos))
+        return path + newExt;
+    return path.substr(0, dotPos) + newExt;
+}
+
+static std::string JoinPath(const std::string& dir, const std::string& file)
+{
+    if (file.empty()) return "";
+    if (dir.empty() || dir == ".") return file;
+    char back = dir.back();
+    if (back == '/' || back == '\\') return dir + file;
+    return dir + "/" + file;
+}
+
+static bool FileExists(const std::string& path)
+{
+    std::ifstream in(path, std::ios::binary);
+    return in.good();
+}
+
+static bool LoadMTL(const std::string& path, Material& mat)
+{
+    std::ifstream file(path);
+    if (!file.is_open())
+    {
+        std::cerr << "Failed to open MTL: " << path << std::endl;
+        return false;
+    }
+
+    std::string line;
+    while (std::getline(file, line))
+    {
+        if (line.empty() || line[0] == '#') continue;
+
+        std::istringstream iss(line);
+        std::string key;
+        iss >> key;
+
+        if (key == "newmtl") iss >> mat.name;
+        else if (key == "Ka") iss >> mat.Ka.x >> mat.Ka.y >> mat.Ka.z;
+        else if (key == "Kd") iss >> mat.Kd.x >> mat.Kd.y >> mat.Kd.z;
+        else if (key == "Ks") iss >> mat.Ks.x >> mat.Ks.y >> mat.Ks.z;
+        else if (key == "Ke") iss >> mat.Ke.x >> mat.Ke.y >> mat.Ke.z;
+        else if (key == "Ns") iss >> mat.Ns;
+        else if (key == "d") iss >> mat.d;
+        else if (key == "Ni") iss >> mat.Ni;
+        else if (key == "illum") iss >> mat.illum;
+        else if (key == "map_Ka") iss >> mat.mapKa;
+        else if (key == "map_Kd") iss >> mat.mapKd;
+        else if (key == "map_Ks") iss >> mat.mapKs;
+    }
+
+    return true;
+}
+
+
 // Shader
 struct LitShader
 {
@@ -83,6 +171,7 @@ struct LitShader
         #version 460 core
         layout(location=0) in vec3 aPos;
         layout(location=1) in vec3 aNormal;
+        layout(location=2) in vec2 aUV;
 
         uniform mat4 uM;
         uniform mat4 uV;
@@ -90,6 +179,7 @@ struct LitShader
 
         out vec3 vWorldPos;
         out vec3 vWorldNormal;
+        out vec2 vUV;
 
         void main()
         {
@@ -99,6 +189,7 @@ struct LitShader
             mat3 normalMat = transpose(inverse(mat3(uM)));
             vWorldNormal = normalize(normalMat * aNormal);
 
+            vUV = vec2(aUV.x, 1.0 - aUV.y);
             gl_Position = uP * uV * worldPos;
         }
     )GLSL";
@@ -107,16 +198,26 @@ struct LitShader
         #version 460 core
         in vec3 vWorldPos;
         in vec3 vWorldNormal;
+        in vec2 vUV;
 
         out vec4 FragColor;
 
         uniform vec3 uCamPosW;
         uniform vec3 uLightPosW;
 
-        uniform vec3 uBaseColor;
+        uniform vec3 uKa;
+        uniform vec3 uKd;
+        uniform vec3 uKs;
+        uniform vec3 uKe;
+        uniform float uNs;
+
         uniform vec3 uAmbientColor;
         uniform vec3 uLightColor;
-        uniform float uShininess;
+
+        uniform sampler2D uDiffuseTex;
+        uniform sampler2D uSpecularTex;
+        uniform int uHasDiffuseTex;
+        uniform int uHasSpecularTex;
 
         void main()
         {
@@ -125,14 +226,23 @@ struct LitShader
             vec3 V = normalize(uCamPosW - vWorldPos);
             vec3 H = normalize(L + V);
 
+            vec3 diffuseColor = uKd;
+            if (uHasDiffuseTex == 1)
+                diffuseColor *= texture(uDiffuseTex, vUV).rgb;
+
+            vec3 specularColor = uKs;
+            if (uHasSpecularTex == 1)
+                specularColor *= texture(uSpecularTex, vUV).rgb;
+
             float diff = max(dot(N, L), 0.0);
-            float spec = pow(max(dot(N, H), 0.0), uShininess);
+            float spec = pow(max(dot(N, H), 0.0), max(uNs, 1.0));
 
-            vec3 ambient = uAmbientColor * uBaseColor;
-            vec3 diffuse = diff * uLightColor * uBaseColor;
-            vec3 specular = spec * uLightColor * 0.80;
+            vec3 ambient = uAmbientColor * uKa * diffuseColor;
+            vec3 diffuse = diff * uLightColor * diffuseColor;
+            vec3 specular = spec * uLightColor * specularColor;
+            vec3 emissive = uKe;
 
-            vec3 color = ambient + diffuse + specular;
+            vec3 color = ambient + diffuse + specular + emissive;
             FragColor = vec4(color, 1.0);
         }
     )GLSL";
@@ -665,6 +775,51 @@ static void DrawFullscreenQuad(GLuint fsQuadVAO)
     glBindVertexArray(fsQuadVAO);
     glDrawArrays(GL_TRIANGLES, 0, 6);
 }
+
+static GLuint LoadTexture2D(const std::string& path, bool srgb)
+{
+    std::vector<unsigned char> image;
+    unsigned w = 0, h = 0;
+
+    unsigned error = lodepng::decode(image, w, h, path);
+    if (error)
+    {
+        std::cerr << "Failed to load PNG texture: " << path
+            << " | error: " << error
+            << " | " << lodepng_error_text(error) << std::endl;
+        return 0;
+    }
+
+    if (image.empty() || w == 0 || h == 0)
+    {
+        std::cerr << "Invalid PNG texture data: " << path << std::endl;
+        return 0;
+    }
+
+    GLuint tex = 0;
+    glCreateTextures(GL_TEXTURE_2D, 1, &tex);
+
+    GLenum internalFormat = srgb ? GL_SRGB8_ALPHA8 : GL_RGBA8;
+    glTextureStorage2D(tex, 1, internalFormat, (GLsizei)w, (GLsizei)h);
+    glTextureSubImage2D(
+        tex,
+        0,
+        0, 0,
+        (GLsizei)w, (GLsizei)h,
+        GL_RGBA,
+        GL_UNSIGNED_BYTE,
+        image.data()
+    );
+
+    glGenerateTextureMipmap(tex);
+
+    glTextureParameteri(tex, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    glTextureParameteri(tex, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTextureParameteri(tex, GL_TEXTURE_WRAP_S, GL_REPEAT);
+    glTextureParameteri(tex, GL_TEXTURE_WRAP_T, GL_REPEAT);
+
+    return tex;
+}
 // ------------------------------
 
 
@@ -906,14 +1061,31 @@ int main(int argc, char** argv)
 {
     if (argc < 2)
     {
-        std::cerr << "Usage: " << argv[0] << " <mesh.obj>\n";
+        std::cerr << "Usage: " << argv[0] << " <mesh.obj> [material.mtl]\n";
         return -1;
     }
 
-    cy::TriMesh mesh;
-    if (!mesh.LoadFromFileObj(argv[1], true, &std::cout))
+    const std::string objPath = argv[1];
+    std::string mtlPath = (argc >= 3) ? argv[2] : ReplaceExtension(objPath, ".mtl");
+    if (!FileExists(mtlPath))
     {
-        std::cerr << "ERROR: failed to load obj: " << argv[1] << "\n";
+        std::cout << "MTL not found, using constant material only: " << mtlPath << std::endl;
+        mtlPath.clear();
+    }
+
+    Material material;
+    if (!mtlPath.empty())
+        LoadMTL(mtlPath, material);
+
+    std::string mtlDir = GetDirectoryFromPath(mtlPath);
+
+    GLuint kdTex = 0;
+    GLuint ksTex = 0;
+
+    cy::TriMesh mesh;
+    if (!mesh.LoadFromFileObj(objPath.c_str(), true, &std::cout))
+    {
+        std::cerr << "ERROR: failed to load obj: " << objPath << "\n";
         return -1;
     }
 
@@ -943,27 +1115,51 @@ int main(int argc, char** argv)
 
     std::vector<float> positions;
     std::vector<float> normals;
+    std::vector<float> texcoords;
     positions.reserve(mesh.NF() * 3 * 3);
     normals.reserve(mesh.NF() * 3 * 3);
+    texcoords.reserve(mesh.NF() * 3 * 2);
+
+    bool hasUVs = mesh.NVT() > 0;
+    if (!hasUVs)
+        std::cout << "OBJ has no texture coordinates. Texture display will not work correctly." << std::endl;
 
     for (unsigned int fi = 0; fi < mesh.NF(); ++fi)
     {
-		auto f = mesh.F((int)fi);
-		auto fn = mesh.FN((int)fi);
+        auto f = mesh.F((int)fi);
+        auto fn = mesh.FN((int)fi);
+        auto ft = mesh.FT((int)fi);
 
         for (int c = 0; c < 3; ++c)
         {
-			int vi = f.v[c];
+            int vi = f.v[c];
             int ni = fn.v[c];
-			cy::Vec3f p = mesh.V(vi);
-			cy::Vec3f n = (mesh.NVN() > 0 && ni >= 0) ? mesh.VN(ni) : cy::Vec3f(0, 1, 0);
+            cy::Vec3f p = mesh.V(vi);
+            cy::Vec3f n = (mesh.NVN() > 0 && ni >= 0) ? mesh.VN(ni) : cy::Vec3f(0, 1, 0);
 
             positions.push_back(p.x);
             positions.push_back(p.y);
             positions.push_back(p.z);
+
             normals.push_back(n.x);
             normals.push_back(n.y);
-			normals.push_back(n.z);
+            normals.push_back(n.z);
+
+            float u = 0.0f;
+            float v = 0.0f;
+            if (hasUVs)
+            {
+                int ti = ft.v[c];
+                if (ti >= 0)
+                {
+                    cy::Vec3f uvw = mesh.VT(ti);
+                    u = uvw.x;
+                    v = uvw.y;
+                }
+            }
+
+            texcoords.push_back(u);
+            texcoords.push_back(v);
         }
     }
 
@@ -1004,6 +1200,11 @@ int main(int argc, char** argv)
         glfwTerminate();
         return -1;
     }
+
+    if (!material.mapKd.empty())
+        kdTex = LoadTexture2D(JoinPath(mtlDir, material.mapKd), true);
+    if (!material.mapKs.empty())
+        ksTex = LoadTexture2D(JoinPath(mtlDir, material.mapKs), false);
 
     std::cout << "GL_VERSION: " << glGetString(GL_VERSION) << "\n";
     std::cout << "GLSL: " << glGetString(GL_SHADING_LANGUAGE_VERSION) << "\n";
@@ -1056,16 +1257,19 @@ int main(int argc, char** argv)
     }
 
     // Mesh VAO
-	GLuint meshVAO = 0, posVBO = 0, normVBO = 0;
+    GLuint meshVAO = 0, posVBO = 0, normVBO = 0, uvVBO = 0;
     glCreateVertexArrays(1, &meshVAO);
     glCreateBuffers(1, &posVBO);
     glCreateBuffers(1, &normVBO);
+    glCreateBuffers(1, &uvVBO);
 
     glNamedBufferData(posVBO, (GLsizeiptr)(positions.size() * sizeof(float)), positions.data(), GL_STATIC_DRAW);
     glNamedBufferData(normVBO, (GLsizeiptr)(normals.size() * sizeof(float)), normals.data(), GL_STATIC_DRAW);
+    glNamedBufferData(uvVBO, (GLsizeiptr)(texcoords.size() * sizeof(float)), texcoords.data(), GL_STATIC_DRAW);
 
     glVertexArrayVertexBuffer(meshVAO, 0, posVBO, 0, 3 * sizeof(float));
     glVertexArrayVertexBuffer(meshVAO, 1, normVBO, 0, 3 * sizeof(float));
+    glVertexArrayVertexBuffer(meshVAO, 2, uvVBO, 0, 2 * sizeof(float));
 
     glEnableVertexArrayAttrib(meshVAO, 0);
     glVertexArrayAttribFormat(meshVAO, 0, 3, GL_FLOAT, GL_FALSE, 0);
@@ -1074,6 +1278,10 @@ int main(int argc, char** argv)
     glEnableVertexArrayAttrib(meshVAO, 1);
     glVertexArrayAttribFormat(meshVAO, 1, 3, GL_FLOAT, GL_FALSE, 0);
     glVertexArrayAttribBinding(meshVAO, 1, 1);
+
+    glEnableVertexArrayAttrib(meshVAO, 2);
+    glVertexArrayAttribFormat(meshVAO, 2, 2, GL_FLOAT, GL_FALSE, 0);
+    glVertexArrayAttribBinding(meshVAO, 2, 2);
 
 	// Fullscreen Quad
     GLuint fsQuadVAO = 0, fsQuadVBO = 0;
@@ -1194,10 +1402,20 @@ int main(int argc, char** argv)
         litShader.prog.SetUniform("uCamPosW", camPosW.x, camPosW.y, camPosW.z);
         litShader.prog.SetUniform("uLightPosW", lightPosW.x, lightPosW.y, lightPosW.z);
 
-        litShader.prog.SetUniform("uBaseColor", 0.82f, 0.58f, 0.32f);
+        litShader.prog.SetUniform("uKa", material.Ka.x, material.Ka.y, material.Ka.z);
+        litShader.prog.SetUniform("uKd", material.Kd.x, material.Kd.y, material.Kd.z);
+        litShader.prog.SetUniform("uKs", material.Ks.x, material.Ks.y, material.Ks.z);
+        litShader.prog.SetUniform("uKe", material.Ke.x, material.Ke.y, material.Ke.z);
+        litShader.prog.SetUniform("uNs", material.Ns);
         litShader.prog.SetUniform("uAmbientColor", 0.16f, 0.16f, 0.18f);
         litShader.prog.SetUniform("uLightColor", 1.0f, 0.96f, 0.90f);
-        litShader.prog.SetUniform("uShininess", 64.0f);
+        litShader.prog.SetUniform("uDiffuseTex", 0);
+        litShader.prog.SetUniform("uSpecularTex", 1);
+        litShader.prog.SetUniform("uHasDiffuseTex", kdTex ? 1 : 0);
+        litShader.prog.SetUniform("uHasSpecularTex", ksTex ? 1 : 0);
+
+        glBindTextureUnit(0, kdTex);
+        glBindTextureUnit(1, ksTex);
 
         glBindVertexArray(meshVAO);
         glDrawArrays(GL_TRIANGLES, 0, (GLsizei)(mesh.NF() * 3));
@@ -1411,6 +1629,11 @@ int main(int argc, char** argv)
     DestroyColorRenderTarget(bloomBrightRT);
     DestroyColorRenderTarget(motionRT);
     DestroySceneRenderTarget(sceneRT);
+
+    if (kdTex) 
+        glDeleteTextures(1, &kdTex);
+    if (ksTex) 
+        glDeleteTextures(1, &ksTex);
 
     glDeleteBuffers(1, &fsQuadVBO);
     glDeleteVertexArrays(1, &fsQuadVAO);
